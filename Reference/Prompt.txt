@@ -1,0 +1,278 @@
+ ---
+  ## Project: SSIP Meal Order Web App (React + Vercel)                                                                                                                                                                             
+   
+  ### Goal                                                                                                                                                                                                                         
+  Build a React web app that replicates the functionality of an existing Android meal ordering app
+  (SSIPMealOrderAppII). The web app targets iPhone users (internal use only) and must be deployable
+  on Vercel's free tier.
+
+  ---
+
+  ### Backend Context
+  The backend is a WooCommerce site at: https://ssip-cafeteria.whew.life
+  It is NOT a REST API — it is a traditional server-rendered WooCommerce site. All data is obtained
+  by:
+  1. Submitting HTML forms (login, checkout)
+  2. Scraping HTML responses with a parser (like cheerio)
+
+  The Android app uses OkHttp + JSoup to do this. The web app will use Vercel serverless functions
+  + cheerio to do the same thing server-side (to bypass browser CORS restrictions).
+
+  ---
+
+  ### Architecture
+
+  **Frontend**: React (Vite), hosted on Vercel
+  **Proxy layer**: Vercel Serverless Functions (`/api/*`) — sits between React and WooCommerce
+  **No database needed**: All state lives in the user's browser localStorage
+  **No Firebase needed**: Vercel alone handles frontend + proxy
+
+  #### Login Flow
+  1. User enters WooCommerce username + password in React app
+  2. React POSTs to `/api/login`
+  3. Proxy does GET `/my-account/` on WooCommerce → extracts hidden nonce/form fields from HTML
+  4. Proxy does POST `/my-account/` with username, password, and nonce fields
+  5. WooCommerce responds with session cookies (e.g., `wordpress_logged_in_*`, `woocommerce_*`)
+  6. Proxy returns those cookies as JSON to the browser
+  7. Browser stores cookies in localStorage under key `wc_session_cookies`
+  8. Every subsequent API call sends `{ cookies }` to the proxy, which attaches them to WooCommerce requests
+
+  **Multi-user isolation**: Each user's browser holds their own WooCommerce session cookies in
+  localStorage. The proxy is completely stateless — it stores nothing.
+
+  ---
+
+  ### Vercel Proxy Functions to Build
+
+  All functions receive cookies from the request body and attach them to WooCommerce requests.
+  Use `node-fetch` or native `fetch` + `cheerio` for HTML parsing in each function.
+
+  | Route | Method | Purpose | WooCommerce URL |
+  |---|---|---|---|
+  | `/api/login` | POST | Authenticate, return session cookies | POST `/my-account/` |
+  | `/api/meals` | POST | Get meals for a date, return parsed list | GET `/lunch/?menu-date=YYYY-MM-DD` |
+  | `/api/orders` | POST | Get order history (paginated) | GET `/orders/` |
+  | `/api/dashboard` | POST | Get wallet balance + upcoming meals | GET `/woo-wallet/` + `/orders/` |
+  | `/api/place-order` | POST | Place a single order | POST `/?wc-ajax=checkout` |
+  | `/api/cancel-order` | POST | Cancel an order | POST to cancel URL |
+
+  #### Request shape for all authenticated routes:
+  ```json
+  { "cookies": { "cookie_name": "cookie_value", ... }, ...otherParams }
+
+  How to attach cookies to WooCommerce fetch:
+
+  const cookieHeader = Object.entries(cookies)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('; ');
+  fetch(url, { headers: { Cookie: cookieHeader } });
+
+  ---
+  Order Placement Detail (Critical)
+
+  The Android app places orders via WooCommerce checkout. The flow is:
+
+  1. GET /lunch/?menu-date=YYYY-MM-DD → scrape meal list (product IDs, prices, names, stall)
+  2. For each meal to order:
+  a. POST to add-to-cart endpoint with product_id and quantity=1
+  b. GET /checkout/ → scrape hidden fields: _wpnonce, payment_method, billing fields, etc.
+  c. POST /?wc-ajax=checkout with all checkout form fields populated with user's saved
+     order details (first name, last name, phone, email, delivery time as order notes)
+  d. Parse response JSON for result: "success" and the order ID
+  3. Extract order_id and the cancel URL from the success response
+
+  User order details (stored in localStorage):
+
+  - First name, last name, phone number, email
+  - Preferred delivery time (used as order notes)
+
+  ---
+  HTML Scraping Reference (from Android app — replicate in cheerio)
+
+  Meal list from /lunch/?menu-date=YYYY-MM-DD:
+  - Meals are in .product or .type-product elements
+  - Each has: product ID (from add-to-cart button data-product_id), name, price, stall category,
+  image URL, description
+  - Stall types: Chinese, Malay, International (from product category)
+
+  Order history from /orders/:
+  - Orders are in table.woocommerce-orders-table rows
+  - Each row: order ID, date, status, total, view link
+  - Pagination via a.next.page-numbers
+
+  Wallet balance from /woo-wallet/:
+  - Balance shown in .woo-wallet-balance or similar element
+
+  Checkout form fields from /checkout/:
+  - #_wpnonce hidden input
+  - payment_method input value
+  - All billing_* fields
+  - ship_to_different_address checkbox state
+
+  ---
+  Features to Implement (match Android app)
+
+  1. Login Screen
+
+  - Username + password fields
+  - "Remember me" toggle (saves credentials in localStorage — note: NOT secure for production,
+  acceptable for internal tool)
+  - Auto-login on app load if credentials are saved
+
+  2. Dashboard Screen
+
+  - Wallet balance
+  - Today's ordered meal (if any)
+  - Upcoming meals list (next 7 days with orders)
+  - Total planned spend, actual spend this month
+
+  3. Order Screen — Two tabs:
+
+  Single Order tab:
+  - Date picker (default: today)
+  - Meal list for selected date (grouped by stall: Chinese / Malay / International)
+  - Each meal card: image, name, price, stall, description
+  - "Order" button per meal → places order immediately
+  - Show success/failure toast
+
+  Batch Order tab:
+  - Multi-date selector (checkboxes for upcoming weekdays)
+  - Single meal selector (pick one meal to apply to all selected dates)
+  - "Place All Orders" button
+  - Progress indicator showing each date's result
+
+  4. Order History Screen
+
+  - List of past orders: date, meal name, stall, price, status (Success/Failed)
+  - Paginated (load more button)
+  - Cancel button for upcoming/pending orders
+
+  5. Settings Screen
+
+  - Personal details form: first name, last name, phone, email
+  - Delivery time preference
+  - Notification time preference (for PWA push — implement if time allows, skip if complex)
+  - Logout button (clears localStorage)
+
+  ---
+  Tech Stack
+
+  Frontend:
+  - React 18 + Vite
+  - React Router v6 (for navigation)
+  - TanStack Query (react-query) for data fetching + caching
+  - Tailwind CSS for styling
+  - shadcn/ui for components (or plain Tailwind if preferred)
+  - date-fns for date handling
+
+  Backend (Vercel Functions):
+  - Node.js serverless functions in /api directory
+  - cheerio for HTML parsing
+  - node-fetch (or native fetch — Node 18+)
+
+  Deployment:
+  - Vercel (free tier)
+  - No environment variables needed (proxy target URL can be hardcoded)
+
+  ---
+  Project Structure
+
+  /
+  ├── api/                          # Vercel serverless functions
+  │   ├── login.js
+  │   ├── meals.js
+  │   ├── orders.js
+  │   ├── dashboard.js
+  │   ├── place-order.js
+  │   └── cancel-order.js
+  ├── src/
+  │   ├── components/
+  │   │   ├── MealCard.jsx
+  │   │   ├── OrderRow.jsx
+  │   │   └── ...
+  │   ├── pages/
+  │   │   ├── LoginPage.jsx
+  │   │   ├── DashboardPage.jsx
+  │   │   ├── OrderPage.jsx
+  │   │   ├── HistoryPage.jsx
+  │   │   └── SettingsPage.jsx
+  │   ├── hooks/
+  │   │   ├── useAuth.js            # Manages cookies in localStorage
+  │   │   ├── useMeals.js
+  │   │   └── useOrders.js
+  │   ├── lib/
+  │   │   └── api.js                # Client-side fetch wrapper that injects cookies
+  │   ├── App.jsx
+  │   └── main.jsx
+  ├── vercel.json
+  ├── package.json
+  └── vite.config.js
+
+  ---
+  localStorage Schema
+
+  // Session cookies from WooCommerce
+  localStorage.setItem('wc_session_cookies', JSON.stringify({ ... }));
+
+  // User credentials (if remember-me enabled)
+  localStorage.setItem('wc_credentials', JSON.stringify({ username, password }));
+
+  // User order details
+  localStorage.setItem('user_order_details', JSON.stringify({
+    firstName, lastName, phone, email, deliveryTime
+  }));
+
+  // Meal cache (1-hour TTL per date)
+  localStorage.setItem(`meal_cache_${date}`, JSON.stringify({ data, timestamp }));
+
+  ---
+  Key Implementation Notes
+
+  1. Rate limiting: Add 500ms delay between batch order placements (match Android app behavior
+  to avoid hitting WooCommerce rate limits)
+  2. Session expiry: If any proxy call returns a redirect to /my-account/ (login page),
+  treat it as session expired → clear cookies → redirect user to login
+  3. Cookie extraction: After login POST, extract Set-Cookie headers from the WooCommerce
+  response. In Node.js fetch, use response.headers.getSetCookie() or parse the raw
+  set-cookie header array.
+  4. CSRF for checkout: The _wpnonce in the checkout form expires quickly. Always fetch
+  /checkout/ fresh immediately before placing each order — do not cache it.
+  5. Mobile-first UI: Design for iPhone Safari. Use min-h-dvh not min-h-screen.
+  Add <meta name="viewport" content="width=device-width, initial-scale=1">.
+  6. PWA manifest (optional): Add manifest.json and service worker so iPhone users can
+  add to home screen for an app-like experience.
+
+  ---
+  Start Here
+
+  Begin by:
+  1. Scaffolding the Vite + React project with Tailwind
+  2. Setting up the /api/login.js serverless function and testing it works end-to-end
+  3. Building the Login screen and wiring it to /api/login
+  4. Then proceed screen by screen: Dashboard → Order → History → Settings
+
+  Do NOT implement push notifications in the initial version — focus on core ordering functionality first.
+
+  ---
+
+  A few tips when you paste this into a new session:
+
+  - If Claude asks to clarify anything, give it the actual WooCommerce URL (`https://ssip-cafeteria.whew.life`) so it can inspect the live HTML structure if needed
+  - Tell it to start with `Step 1` (scaffold + login API) and verify that works before moving on — the login proxy is the riskiest piece
+  - If cheerio scraping breaks on any page, have it `console.log` the raw HTML in the serverless function so you can see what the actual DOM looks like
+
+
+### Reference Android App
+  The existing Android app source code is at:                                                                                                                                                                                      
+  D:\Workspace\ProgramProject\Android\SSIPMealOrderAppII
+                                                                                                                                                                                                                                   
+  Reference it (especially the repository and scraping layers) to extract:
+  - Exact HTML selectors used for parsing meals, orders, wallet balance
+  - Exact form field names for login and checkout
+  - Exact cookie names to extract after login
+  - The order placement request body structure
+
+  Key files to read first:
+  - app/src/main/java/com/example/ssipmealorderappii/data/repository/
+  - app/src/main/java/com/example/ssipmealorderappii/data/remote/
+
