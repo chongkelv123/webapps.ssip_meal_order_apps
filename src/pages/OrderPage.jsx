@@ -1,11 +1,10 @@
-import { useState, useEffect } from 'react';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useState } from 'react';
+import { useQuery, useQueries, useQueryClient, useMutation } from '@tanstack/react-query';
 import {
   format, addDays, isWeekend, parseISO,
   startOfWeek, startOfMonth, endOfMonth, eachDayOfInterval,
 } from 'date-fns';
 import { getMeals, placeOrder } from '../lib/api.js';
-import MealCard from '../components/MealCard.jsx';
 import LoadingSpinner from '../components/LoadingSpinner.jsx';
 import { useToast } from '../hooks/useToast.jsx';
 
@@ -36,45 +35,7 @@ function getWorkingDaysInMonth(monthStr) {
 // ── Day Tab ──────────────────────────────────────────────────────────────────
 
 function DayTab() {
-  const toast = useToast();
-  const queryClient = useQueryClient();
   const [date, setDate] = useState(todayStr());
-  const [orderingId, setOrderingId] = useState(null);
-
-  const { data, isLoading, isError, error } = useQuery({
-    queryKey: ['meals', date],
-    queryFn: () => getMeals(date),
-  });
-
-  const mutation = useMutation({
-    mutationFn: ({ productId, orderDetails }) => placeOrder(productId, date, orderDetails),
-    onSuccess: (result, { mealName }) => {
-      if (result.success) {
-        toast.success(`Order placed for ${mealName}!`);
-        queryClient.invalidateQueries({ queryKey: ['dashboard'] });
-      } else {
-        toast.error(result.error || 'Order failed');
-      }
-    },
-    onError: (err) => toast.error(err.message),
-    onSettled: () => setOrderingId(null),
-  });
-
-  function handleOrder(meal) {
-    const orderDetails = getOrderDetails();
-    if (!orderDetails?.firstName) {
-      toast.error('Please fill in your order details in Settings first');
-      return;
-    }
-    setOrderingId(meal.productId);
-    mutation.mutate({ productId: meal.productId, orderDetails, mealName: meal.name });
-  }
-
-  const meals = data?.meals || [];
-  const grouped = meals.reduce((acc, m) => {
-    (acc[m.stall] = acc[m.stall] || []).push(m);
-    return acc;
-  }, {});
 
   return (
     <div className="flex flex-col gap-4">
@@ -85,82 +46,80 @@ function DayTab() {
         onChange={(e) => setDate(e.target.value)}
         className="w-full px-4 py-3 bg-white border border-gray-200 rounded-xl text-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500"
       />
-
-      {isLoading && <LoadingSpinner className="py-8" />}
-      {isError && <p className="text-red-600 text-sm text-center py-4">{error.message}</p>}
-      {!isLoading && !isError && meals.length === 0 && (
-        <div className="text-center py-12 text-gray-400 text-sm">No meals available for this date</div>
-      )}
-
-      {Object.entries(grouped).map(([stall, stallMeals]) => (
-        <div key={stall}>
-          <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wide mb-2">{stall}</h3>
-          <div className="grid grid-cols-2 gap-3">
-            {stallMeals.map((meal) => (
-              <MealCard
-                key={meal.productId}
-                meal={meal}
-                onOrder={handleOrder}
-                ordering={orderingId === meal.productId}
-              />
-            ))}
-          </div>
-        </div>
-      ))}
+      <PerDayOrderPanel key={date} dates={[date]} />
     </div>
   );
 }
 
-// ── Batch Panel (shared by Week & Month) ─────────────────────────────────────
+// ── Meal Thumbnail ───────────────────────────────────────────────────────────
 
-function BatchPanel({ availableDates, gridCols = 4 }) {
+function MealThumb({ imageUrl, name }) {
+  const [imgError, setImgError] = useState(false);
+  return (
+    <div className="w-12 h-12 rounded-lg bg-gray-100 flex-shrink-0 overflow-hidden flex items-center justify-center">
+      {imageUrl && !imgError ? (
+        <img
+          src={imageUrl}
+          alt={name}
+          className="w-full h-full object-cover"
+          onError={() => setImgError(true)}
+        />
+      ) : (
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} className="w-5 h-5 text-gray-300">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909M3 21h18M3.75 3h16.5M4.5 3v18m15-18v18" />
+        </svg>
+      )}
+    </div>
+  );
+}
+
+// ── Per-Day Order Panel (shared by Week & Month) ─────────────────────────────
+// Each day shows its own meal list; user picks one meal per day independently.
+
+function PerDayOrderPanel({ dates }) {
   const toast = useToast();
   const queryClient = useQueryClient();
-  const [selectedDates, setSelectedDates] = useState(availableDates);
-  const [mealDate, setMealDate] = useState(availableDates[0] || todayStr());
-  const [selectedMeal, setSelectedMeal] = useState(null);
+  const [selectedMeals, setSelectedMeals] = useState({}); // { date: meal }
   const [running, setRunning] = useState(false);
   const [progress, setProgress] = useState(null);
 
-  const gridClass = { 4: 'grid-cols-4', 5: 'grid-cols-5' }[gridCols] || 'grid-cols-4';
-
-  const { data: mealsData, isLoading: mealsLoading } = useQuery({
-    queryKey: ['meals', mealDate],
-    queryFn: () => getMeals(mealDate),
-    enabled: !!mealDate,
+  const queryResults = useQueries({
+    queries: dates.map((date) => ({
+      queryKey: ['meals', date],
+      queryFn: () => getMeals(date),
+    })),
   });
 
-  const meals = mealsData?.meals || [];
+  const selectedCount = Object.keys(selectedMeals).length;
+  const totalPrice = Object.values(selectedMeals).reduce((sum, m) => sum + m.price, 0);
 
-  function toggleDate(d) {
-    setSelectedDates((prev) =>
-      prev.includes(d) ? prev.filter((x) => x !== d) : [...prev, d]
-    );
-  }
-
-  function toggleAll() {
-    setSelectedDates((prev) =>
-      prev.length === availableDates.length ? [] : [...availableDates]
-    );
+  function toggleMeal(date, meal) {
+    setSelectedMeals((prev) => {
+      if (prev[date]?.productId === meal.productId) {
+        const next = { ...prev };
+        delete next[date];
+        return next;
+      }
+      return { ...prev, [date]: meal };
+    });
   }
 
   async function handlePlaceAll() {
-    if (!selectedDates.length) return toast.error('Select at least one date');
-    if (!selectedMeal) return toast.error('Select a meal');
+    if (!selectedCount) return toast.error('Select at least one meal');
     const orderDetails = getOrderDetails();
     if (!orderDetails?.firstName) {
       return toast.error('Please fill in your order details in Settings first');
     }
 
     setRunning(true);
-    const sorted = [...selectedDates].sort();
+    const sorted = Object.entries(selectedMeals).sort(([a], [b]) => a.localeCompare(b));
     const results = [];
     setProgress({ current: 0, total: sorted.length, results });
 
     for (let i = 0; i < sorted.length; i++) {
-      const date = sorted[i];
+      const [date, meal] = sorted[i];
       try {
-        const result = await placeOrder(selectedMeal.productId, date, orderDetails);
+        const result = await placeOrder(meal.productId, date, orderDetails);
         results.push({ date, success: result.success, error: result.error });
       } catch (err) {
         results.push({ date, success: false, error: err.message });
@@ -176,86 +135,83 @@ function BatchPanel({ availableDates, gridCols = 4 }) {
   }
 
   return (
-    <div className="flex flex-col gap-4">
-      {/* Date chips */}
-      <div>
-        <div className="flex items-center justify-between mb-2">
-          <p className="text-sm font-medium text-gray-700">Select Dates</p>
-          <button
-            onClick={toggleAll}
-            className="text-xs text-blue-600 font-medium"
-          >
-            {selectedDates.length === availableDates.length ? 'Deselect all' : 'Select all'}
-          </button>
-        </div>
-        <div className={`grid ${gridClass} gap-2`}>
-          {availableDates.map((d) => {
-            const sel = selectedDates.includes(d);
-            return (
-              <button
-                key={d}
-                onClick={() => toggleDate(d)}
-                className={`py-2 px-1 rounded-xl text-xs font-medium border transition-colors
-                  ${sel ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 border-gray-200'}`}
-              >
-                <span className="block font-semibold">{format(parseISO(d), 'EEE')}</span>
-                <span className="block">{format(parseISO(d), 'MMM d')}</span>
-              </button>
-            );
-          })}
-        </div>
-      </div>
+    <div className="flex flex-col gap-3">
+      {dates.map((date, i) => {
+        const result = queryResults[i];
+        const meals = result.data?.meals || [];
+        const selected = selectedMeals[date];
 
-      {/* Meal picker */}
-      <div>
-        <div className="flex items-center justify-between mb-2">
-          <p className="text-sm font-medium text-gray-700">Choose Meal</p>
-          <input
-            type="date"
-            value={mealDate}
-            onChange={(e) => { setMealDate(e.target.value); setSelectedMeal(null); }}
-            className="text-xs px-3 py-1.5 bg-white border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-
-        {mealsLoading && <LoadingSpinner className="py-4" />}
-        {!mealsLoading && meals.length === 0 && (
-          <p className="text-sm text-gray-400 text-center py-3">No meals for this date</p>
-        )}
-
-        <div className="flex flex-col gap-2">
-          {meals.map((meal) => (
-            <button
-              key={meal.productId}
-              onClick={() => setSelectedMeal(meal)}
-              className={`flex items-center gap-3 p-3 rounded-xl border text-left transition-colors
-                ${selectedMeal?.productId === meal.productId
-                  ? 'border-blue-600 bg-blue-50'
-                  : 'border-gray-200 bg-white'}`}
-            >
-              <div
-                className={`w-4 h-4 rounded-full border-2 flex-shrink-0
-                  ${selectedMeal?.productId === meal.productId
-                    ? 'border-blue-600 bg-blue-600'
-                    : 'border-gray-300'}`}
-              />
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-medium text-gray-900 truncate">{meal.name}</p>
-                <p className="text-xs text-gray-500">{meal.stall} · ${meal.price.toFixed(2)}</p>
+        return (
+          <div key={date} className="bg-white rounded-2xl p-4 shadow-sm">
+            {/* Day header */}
+            <div className="flex items-center justify-between mb-2">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-bold text-blue-600">
+                  {format(parseISO(date), 'EEE')}
+                </span>
+                <span className="text-sm text-gray-500">{format(parseISO(date), 'MMM d')}</span>
               </div>
-            </button>
-          ))}
+              {selected && (
+                <span className="text-xs text-green-600 font-medium">
+                  ✓ {selected.name} · ${selected.price.toFixed(2)}
+                </span>
+              )}
+            </div>
+
+            {result.isLoading && <LoadingSpinner />}
+            {result.isError && (
+              <p className="text-xs text-red-500 py-1">Failed to load meals</p>
+            )}
+            {!result.isLoading && !result.isError && meals.length === 0 && (
+              <p className="text-xs text-gray-400 py-1">No meals available</p>
+            )}
+
+            <div className="flex flex-col gap-1.5">
+              {meals.map((meal) => (
+                <button
+                  key={meal.productId}
+                  onClick={() => toggleMeal(date, meal)}
+                  className={`flex items-center gap-3 p-2.5 rounded-xl border text-left transition-colors
+                    ${selected?.productId === meal.productId
+                      ? 'border-blue-600 bg-blue-50'
+                      : 'border-gray-200'}`}
+                >
+                  <MealThumb imageUrl={meal.imageUrl} name={meal.name} />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-gray-900 truncate">{meal.name}</p>
+                    <p className="text-xs text-gray-500">{meal.stall} · ${meal.price.toFixed(2)}</p>
+                  </div>
+                  <div
+                    className={`w-4 h-4 rounded-full border-2 flex-shrink-0
+                      ${selected?.productId === meal.productId
+                        ? 'border-blue-600 bg-blue-600'
+                        : 'border-gray-300'}`}
+                  />
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+
+      {/* Summary bar */}
+      {selectedCount > 0 && (
+        <div className="bg-blue-50 rounded-2xl px-4 py-3 flex items-center justify-between">
+          <p className="text-sm font-semibold text-gray-900">
+            {selectedCount} meal{selectedCount !== 1 ? 's' : ''} selected
+          </p>
+          <p className="text-sm font-bold text-blue-600">Total: ${totalPrice.toFixed(2)}</p>
         </div>
-      </div>
+      )}
 
       <button
         onClick={handlePlaceAll}
-        disabled={running || !selectedDates.length || !selectedMeal}
+        disabled={running || selectedCount === 0}
         className="w-full py-3.5 bg-blue-600 text-white font-semibold rounded-xl disabled:opacity-50 active:bg-blue-700 transition-colors"
       >
         {running
           ? `Placing orders… (${progress?.current}/${progress?.total})`
-          : `Place ${selectedDates.length || 0} Order${selectedDates.length !== 1 ? 's' : ''}`}
+          : `Place ${selectedCount} Order${selectedCount !== 1 ? 's' : ''}`}
       </button>
 
       {progress?.results.length > 0 && (
@@ -299,7 +255,7 @@ function WeekTab() {
           Week: {format(parseISO(weekDates[0]), 'MMM d')} – {format(parseISO(weekDates[4]), 'MMM d, yyyy')}
         </p>
       </div>
-      <BatchPanel key={weekDates.join()} availableDates={weekDates} gridCols={5} />
+      <PerDayOrderPanel key={weekDates.join()} dates={weekDates} />
     </div>
   );
 }
@@ -322,7 +278,7 @@ function MonthTab() {
         />
         <p className="text-xs text-gray-500 mt-1">{monthDates.length} working days</p>
       </div>
-      <BatchPanel key={month} availableDates={monthDates} gridCols={4} />
+      <PerDayOrderPanel key={month} dates={monthDates} />
     </div>
   );
 }

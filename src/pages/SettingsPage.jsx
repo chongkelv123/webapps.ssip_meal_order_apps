@@ -146,9 +146,10 @@ export default function SettingsPage() {
         </button>
       </div>
 
-      <p className="text-xs text-center text-gray-400 pb-2">
-        SSIP Meal Order App · Internal use only
-      </p>
+      <div className="flex flex-col items-center gap-0.5 pb-2">
+        <p className="text-xs text-gray-400">SSIP Meal Order App · v1.0.0</p>
+        <p className="text-xs text-gray-400">© 2026 Kelvin Chong. All rights reserved.</p>
+      </div>
     </div>
   );
 }

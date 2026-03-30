@@ -68,47 +68,84 @@ function extractMeals(html) {
   const $ = load(html, { baseURI: BASE_URL });
   const meals = [];
 
+  // This site has a custom thumbnail grid where name and price live inside
+  // div[data-id_food="PRODUCT_ID"] > figure > figcaption (h3 = name, h5 bdi = price).
+  // The add-to-cart buttons are in a separate div.single-product section with no
+  // price in its HTML, so we must cross-reference by productId.
+  const gridData = {};
+  $('[data-id_food]').each((_, el) => {
+    const foodId = $(el).attr('data-id_food');
+    if (!foodId) return;
+
+    const name = $(el).find('figcaption h3').first().text().trim();
+
+    // bdi contains a currency-symbol child span + text node e.g. "$" + "3.50"
+    const bdiRaw = $(el).find('bdi').first().text().replace(/\s+/g, '');
+    const price = parsePrice(bdiRaw) ??
+      (bdiRaw ? (parseFloat(bdiRaw.replace(/[^\d.]/g, '')) || null) : null);
+
+    const imageUrl = extractImageUrl($(el));
+
+    if (name && price !== null && price >= MIN_PRICE && price <= MAX_PRICE) {
+      gridData[foodId] = { name, price, imageUrl };
+    }
+  });
+
   const buttons = $('button[name="add-to-cart"]');
 
   buttons.each((_, btn) => {
     const productId = $(btn).attr('value');
     if (!productId) return;
 
-    const container = findProductContainer(btn.parent, $);
-    const $container = container || $(btn).closest('li, article, div.product');
+    // Primary: use the custom grid data matched by productId
+    const grid = gridData[productId];
+    let name = grid?.name ?? null;
+    let price = grid?.price ?? null;
+    let imageUrl = grid?.imageUrl ?? null;
 
-    // Extract name — prefer the WooCommerce title element
-    let name =
-      $container.find('.woocommerce-loop-product__title, .product_title').first().text().trim();
+    // Fallback: traverse to the nearest product container
+    if (!name || price === null) {
+      const container = findProductContainer(btn.parent, $);
+      const $container = container || $(btn).closest('li, article, div.product');
 
-    // Fallback: keyword scan of container text
-    if (!name) {
-      const text = $container.text().replace(/\s+/g, ' ').trim();
-      const keywords = ['STALL', 'SET', 'CHINESE', 'MALAY', 'NASI', 'RICE', 'VEGETARIAN', 'INTERNATIONAL', 'JAPANESE', 'PASTA'];
-      for (const kw of keywords) {
-        const idx = text.toUpperCase().indexOf(kw);
-        if (idx !== -1) {
-          name = text.substring(Math.max(0, idx - 20), Math.min(text.length, idx + 60)).trim();
-          break;
+      if (!name) {
+        name = $container
+          .find('h1.product_title, h2.product_title, .entry-title, .woocommerce-loop-product__title')
+          .first().text().trim();
+
+        if (!name) {
+          const text = $container.text().replace(/\s+/g, ' ').trim();
+          const keywords = ['STALL', 'SET', 'CHINESE', 'MALAY', 'NASI', 'RICE', 'VEGETARIAN', 'INTERNATIONAL', 'JAPANESE', 'PASTA'];
+          for (const kw of keywords) {
+            const idx = text.toUpperCase().indexOf(kw);
+            if (idx !== -1) {
+              name = text.substring(Math.max(0, idx - 20), Math.min(text.length, idx + 80)).trim();
+              break;
+            }
+          }
+        }
+        if (name) {
+          name = name
+            .replace(/^\d+\s+in\s+stock\s+/i, '')
+            .replace(/\s+quantity.*$/i, '')
+            .replace(/\s+add\s+to\s+cart.*$/i, '')
+            .trim();
         }
       }
+
+      if (price === null) {
+        $container.find('bdi').each((_, bdi) => {
+          if (price !== null) return;
+          const raw = $(bdi).text().replace(/\s+/g, '');
+          const p = parsePrice(raw) ?? (raw ? parseFloat(raw.replace(/[^\d.]/g, '')) || null : null);
+          if (p !== null && !isNaN(p) && p >= MIN_PRICE && p <= MAX_PRICE) price = p;
+        });
+      }
+
+      if (!imageUrl) imageUrl = extractImageUrl($container);
     }
 
-    if (!name) return;
-
-    // Extract price
-    let price = null;
-    const priceSpan = $container.find('span.woocommerce-Price-amount bdi').first();
-    if (priceSpan.length) {
-      price = parsePrice(priceSpan.text());
-    }
-    if (price === null) {
-      price = parsePrice($container.text());
-    }
-    if (price === null || price < MIN_PRICE || price > MAX_PRICE) return;
-
-    // Extract image
-    const imageUrl = extractImageUrl($container);
+    if (!name || price === null) return;
 
     meals.push({ productId, name: name.trim(), price, stall: determineStall(name), imageUrl });
   });
