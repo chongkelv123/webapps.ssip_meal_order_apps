@@ -111,10 +111,8 @@ export function parsePrice(text) {
  */
 export function dateToUnixTimestamp(dateStr) {
   const [year, month, day] = dateStr.split('-').map(Number);
-  // Malaysia is UTC+8; midnight local = 16:00 previous day UTC
-  const utcMs = Date.UTC(year, month - 1, day, 0, 0, 0);
-  const malaysiaOffsetMs = 8 * 60 * 60 * 1000;
-  return Math.floor((utcMs - malaysiaOffsetMs) / 1000).toString();
+  // exwfood stores delivery dates as UTC-midnight Unix timestamps (no local offset).
+  return Math.floor(Date.UTC(year, month - 1, day, 0, 0, 0) / 1000).toString();
 }
 
 /**

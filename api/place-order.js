@@ -4,6 +4,7 @@ import {
   USER_AGENT,
   cookieHeader,
   extractCookies,
+  fetchFollowing,
   dateToUnixTimestamp,
   jsonError,
 } from './_utils.js';
@@ -19,52 +20,138 @@ async function addToCart(productId, date, cookies) {
   });
 
   const url = `${BASE_URL}/lunch/?menu-date=${date}`;
-  const cookieStr = cookieHeader(cookies);
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': USER_AGENT,
-      Cookie: cookieStr,
-      Origin: BASE_URL,
-      Referer: url,
+  // Follow the 302 redirect so we capture any session-cookie updates that
+  // WooCommerce sets on the redirect target (not just the 302 itself).
+  const { res } = await fetchFollowing(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        Origin: BASE_URL,
+        Referer: url,
+      },
+      body: formData.toString(),
     },
-    body: formData.toString(),
-    redirect: 'manual',
-  });
+    cookies,
+  );
 
-  // Capture any updated session cookies from WooCommerce
-  extractCookies(res, cookies);
-
-  // Success is anything non-5xx (WooCommerce returns 302 redirect on success)
   return res.status < 500;
 }
 
 async function checkout(date, orderDetails, cookies) {
-  const cookieStr = cookieHeader(cookies);
-
-  // Step 1: Fetch checkout page for hidden fields (_wpnonce, etc.)
-  const getRes = await fetch(CHECKOUT_URL, {
-    headers: { 'User-Agent': USER_AGENT, Cookie: cookieStr },
-    redirect: 'follow',
-  });
-
-  extractCookies(getRes, cookies);
-  const checkoutHtml = await getRes.text();
+  // Step 1: Fetch checkout page, following any redirects so every
+  // Set-Cookie hop is captured into `cookies`.
+  const { text: checkoutHtml } = await fetchFollowing(CHECKOUT_URL, {}, cookies);
 
   if (checkoutHtml.includes('woocommerce-form-login')) {
     throw new Error('SESSION_EXPIRED');
   }
 
   const $ = load(checkoutHtml);
+
+  // Guard: if WooCommerce redirected us away from checkout (e.g. cart is empty),
+  // the form won't exist and we'd submit without a nonce.
+  const $form = $('form[name=checkout], form.woocommerce-checkout').first();
+  if (!$form.length) {
+    console.error('[place-order] Checkout form not found — cart may be empty. Snippet:', checkoutHtml.slice(0, 300));
+    return { success: false, error: 'Could not load checkout page (cart may be empty after add-to-cart)' };
+  }
+
   const hiddenFields = {};
 
-  $('form[name=checkout] input[type=hidden]').each((_, el) => {
+  $form.find('input[type=hidden]').each((_, el) => {
     const name = $(el).attr('name');
     const value = $(el).attr('value') || '';
     if (name) hiddenFields[name] = value;
   });
+
+  // Some themes/plugins place the nonce outside the <form>; search globally as fallback.
+  for (const nonceName of ['woocommerce-process-checkout-nonce', '_wpnonce']) {
+    if (!hiddenFields[nonceName]) {
+      const val = $(`input[name="${nonceName}"]`).first().attr('value');
+      if (val) hiddenFields[nonceName] = val;
+    }
+  }
+
+  console.log('[place-order] Hidden fields:', Object.keys(hiddenFields).join(', ') || '(none)');
+
+  // ── Resolve exwfood delivery date & time ───────────────────────────────────
+  const exwfoodDate = dateToUnixTimestamp(date);
+
+  // The exwfood_time_deli <select> is always empty in raw HTML — the plugin fills
+  // it via an AJAX call after the user picks a date.  We need to call that same
+  // endpoint ourselves to get real option values for the chosen date.
+  let exwfoodTime = orderDetails.deliveryTime || '';
+
+  // 1. Find the exwfood AJAX config in inline scripts (wp_localize_script output).
+  let exwfAjaxUrl = `${BASE_URL}/wp-admin/admin-ajax.php`;
+  let exwfNonce = '';
+  let exwfAction = '';
+
+  $('script').each((_, el) => {
+    const src = $(el).html() || '';
+    if (!src.includes('exwf')) return;
+    // Match: var <name> = { ... "ajax_url": "...", "nonce": "..." ... }
+    const objMatch = src.match(/var\s+\w+\s*=\s*\{([\s\S]+?)\};/);
+    if (!objMatch) return;
+    const inner = objMatch[1];
+    const urlM = inner.match(/"ajax_url"\s*:\s*"([^"]+)"/);
+    const nonceM = inner.match(/"nonce"\s*:\s*"([^"]+)"/);
+    const actionM = inner.match(/"action"\s*:\s*"([^"]+)"/);
+    if (urlM) exwfAjaxUrl = urlM[1].replace(/\\\//g, '/');
+    if (nonceM) exwfNonce = nonceM[1];
+    if (actionM) exwfAction = actionM[1];
+  });
+
+  console.log('[place-order] exwfood nonce:', exwfNonce || '(not found)', '| action hint:', exwfAction || '(none)');
+
+  // 2. Call the time-slot endpoint, trying common action names.
+  const candidateActions = exwfAction
+    ? [exwfAction]
+    : ['exwfood_check_time', 'exwf_check_time', 'exwfood_get_time', 'exwf_get_time', 'exwfood_get_timeslot'];
+
+  for (const action of candidateActions) {
+    try {
+      const tsRes = await fetch(exwfAjaxUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'User-Agent': USER_AGENT,
+          Cookie: cookieHeader(cookies),
+        },
+        body: new URLSearchParams({ action, date: exwfoodDate, security: exwfNonce }).toString(),
+      });
+      const tsText = await tsRes.text();
+      console.log('[place-order] time-slot action=' + action + ' →', tsText.slice(0, 200));
+
+      if (!tsText || tsText === '0' || tsText === '-1') continue;
+
+      // Response is HTML <option> elements; parse them.
+      const $opts = load(tsText);
+      const timeOpts = [];
+      $opts('option').each((_, o) => {
+        const v = $opts(o).attr('value');
+        const t = $opts(o).text().trim();
+        if (v) timeOpts.push({ value: v, text: t });
+      });
+
+      if (!timeOpts.length) continue;
+
+      console.log('[place-order] Available time slots:', JSON.stringify(timeOpts));
+      const match = timeOpts.find(
+        (o) => o.text === orderDetails.deliveryTime || o.value === orderDetails.deliveryTime,
+      );
+      exwfoodTime = match ? match.value : timeOpts[0].value;
+      console.log('[place-order] Using time slot value:', exwfoodTime);
+      break;
+    } catch (e) {
+      console.log('[place-order] action=' + action + ' failed:', e.message);
+    }
+  }
+
+  console.log('[place-order] Submitting exwfood_date_deli:', exwfoodDate, '| exwfood_time_deli:', exwfoodTime);
 
   // Step 2: Build and submit checkout form
   const now = new Date();
@@ -81,15 +168,17 @@ async function checkout(date, orderDetails, cookies) {
     wc_order_attribution_session_pages: '5',
     wc_order_attribution_session_count: '1',
     wc_order_attribution_user_agent: USER_AGENT,
+    payment_method: 'bacs',
+    ...hiddenFields,
+    // These must come after hiddenFields so they are not overridden by
+    // empty default hidden inputs the checkout page may render for these fields.
     billing_first_name: orderDetails.firstName,
     billing_last_name: orderDetails.lastName,
     billing_phone: orderDetails.phone,
     billing_email: orderDetails.email,
-    exwfood_date_deli: dateToUnixTimestamp(date),
-    exwfood_time_deli: orderDetails.deliveryTime || '',
+    exwfood_date_deli: exwfoodDate,
+    exwfood_time_deli: exwfoodTime,
     order_comments: orderDetails.orderNotes || orderDetails.deliveryTime || '',
-    payment_method: 'bacs',
-    ...hiddenFields,
   });
 
   const postRes = await fetch(CHECKOUT_AJAX_URL, {
@@ -123,6 +212,7 @@ async function checkout(date, orderDetails, cookies) {
   const msg = json.messages
     ? load(json.messages).text().trim()
     : JSON.stringify(json);
+  console.error('[place-order] checkout failed:', msg, '| raw:', JSON.stringify(json).slice(0, 500));
   return { success: false, error: msg };
 }
 
