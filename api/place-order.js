@@ -60,7 +60,9 @@ async function checkout(date, orderDetails, cookies) {
   const $ = load(checkoutHtml);
   const hiddenFields = {};
 
-  $('form[name=checkout] input[type=hidden]').each((_, el) => {
+  // Try multiple selectors for robustness across WooCommerce themes
+  const $form = $('form[name=checkout], form.woocommerce-checkout, form.checkout').first();
+  $form.find('input[type=hidden]').each((_, el) => {
     const name = $(el).attr('name');
     const value = $(el).attr('value') || '';
     if (name) hiddenFields[name] = value;
@@ -71,6 +73,11 @@ async function checkout(date, orderDetails, cookies) {
   const sessionStartTime = now.toISOString();
 
   const formData = new URLSearchParams({
+    // WooCommerce nonce + hidden form fields must come first so our explicit
+    // values below take precedence over any conflicting hidden inputs
+    // (e.g. exwfood pre-populating exwfood_date_deli / exwfood_time_deli with
+    // empty or stale values from the session).
+    ...hiddenFields,
     wc_order_attribution_source_type: 'typein',
     wc_order_attribution_referrer: '(none)',
     wc_order_attribution_utm_campaign: '(none)',
@@ -89,7 +96,6 @@ async function checkout(date, orderDetails, cookies) {
     exwfood_time_deli: orderDetails.deliveryTime || '',
     order_comments: orderDetails.orderNotes || orderDetails.deliveryTime || '',
     payment_method: 'bacs',
-    ...hiddenFields,
   });
 
   const postRes = await fetch(CHECKOUT_AJAX_URL, {
@@ -123,6 +129,7 @@ async function checkout(date, orderDetails, cookies) {
   const msg = json.messages
     ? load(json.messages).text().trim()
     : JSON.stringify(json);
+  console.error('[place-order] checkout failed:', msg);
   return { success: false, error: msg };
 }
 
