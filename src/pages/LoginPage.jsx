@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth.jsx';
 
 export default function LoginPage() {
@@ -134,6 +134,11 @@ export default function LoginPage() {
           {loading ? 'Signing in…' : 'Sign In'}
         </button>
       </form>
+
+      <div className="flex gap-4 mt-8">
+        <Link to="/about" className="text-xs text-gray-400 hover:text-gray-600 transition-colors">About</Link>
+        <Link to="/contact" className="text-xs text-gray-400 hover:text-gray-600 transition-colors">Contact Us</Link>
+      </div>
     </div>
   );
 }

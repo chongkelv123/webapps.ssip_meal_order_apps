@@ -1,4 +1,5 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth.jsx';
 import { useToast } from '../hooks/useToast.jsx';
 
@@ -133,6 +134,28 @@ export default function SettingsPage() {
           {saved ? '✓ Saved' : 'Save Settings'}
         </button>
       </form>
+
+      {/* Info links */}
+      <div className="border-t border-gray-100 pt-4 flex flex-col gap-2">
+        <Link
+          to="/about"
+          className="flex items-center justify-between px-4 py-3 bg-gray-50 rounded-xl text-gray-700 active:bg-gray-100 transition-colors"
+        >
+          <span className="text-sm font-medium">About</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="w-4 h-4 text-gray-400">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+        </Link>
+        <Link
+          to="/contact"
+          className="flex items-center justify-between px-4 py-3 bg-gray-50 rounded-xl text-gray-700 active:bg-gray-100 transition-colors"
+        >
+          <span className="text-sm font-medium">Contact Us</span>
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} className="w-4 h-4 text-gray-400">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+          </svg>
+        </Link>
+      </div>
 
       {/* Logout */}
       <div className="border-t border-gray-100 pt-4">

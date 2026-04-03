@@ -7,6 +7,8 @@ import LoginPage from './pages/LoginPage.jsx';
 import DashboardPage from './pages/DashboardPage.jsx';
 import OrderPage from './pages/OrderPage.jsx';
 import SettingsPage from './pages/SettingsPage.jsx';
+import AboutPage from './pages/AboutPage.jsx';
+import ContactPage from './pages/ContactPage.jsx';
 import BottomNav from './components/BottomNav.jsx';
 
 const queryClient = new QueryClient({
@@ -82,6 +84,8 @@ export default function App() {
             <ToastProvider>
               <Routes>
                 <Route path="/login" element={<LoginPage />} />
+                <Route path="/about" element={<AboutPage />} />
+                <Route path="/contact" element={<ContactPage />} />
 
                 {/* All authenticated routes share the AuthLayout */}
                 <Route element={<AuthLayout />}>

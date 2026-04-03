@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
+import posthog from 'posthog-js';
 import { login as apiLogin } from '../lib/api.js';
 
 const AuthContext = createContext(null);
@@ -24,6 +25,7 @@ export function AuthProvider({ children }) {
   const login = useCallback(async (username, password, rememberMe) => {
     const data = await apiLogin(username, password);
     localStorage.setItem('wc_session_cookies', JSON.stringify(data.cookies));
+    posthog.identify(username);
     setIsLoggedIn(true);
 
     if (rememberMe) {
@@ -36,6 +38,7 @@ export function AuthProvider({ children }) {
   const logout = useCallback(() => {
     localStorage.removeItem('wc_session_cookies');
     localStorage.removeItem('wc_credentials');
+    posthog.reset();
     setIsLoggedIn(false);
     navigate('/login', { replace: true });
   }, [navigate]);

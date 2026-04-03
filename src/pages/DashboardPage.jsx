@@ -117,6 +117,13 @@ export default function DashboardPage() {
           <p className="text-sm text-blue-500">{monthLabel}</p>
         </div>
 
+        {/* Banner */}
+        <div className="bg-blue-600 rounded-2xl px-4 py-3">
+          <p className="text-white text-sm font-medium leading-snug">
+            Eat all you want lah. We handle the orders, you handle your weight. 😄
+          </p>
+        </div>
+
         {/* Spend tiles — top, like Android */}
         <div className="flex gap-3">
           <SpendTile
