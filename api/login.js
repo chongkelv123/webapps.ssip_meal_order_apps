@@ -17,10 +17,14 @@ export default async function handler(req, res) {
     const cookieJar = {};
 
     // Step 1: GET login page — follow redirects so we always land on the actual form
-    const { text: loginHtml } = await fetchFollowing(LOGIN_URL, {
+    const { text: loginHtml, res: loginPageRes } = await fetchFollowing(LOGIN_URL, {
       headers: { 'User-Agent': USER_AGENT },
     }, cookieJar);
     const $ = load(loginHtml);
+
+    console.log('[login][debug] GET login page status:', loginPageRes.status, loginPageRes.url);
+    console.log('[login][debug] login page length:', loginHtml.length);
+    console.log('[login][debug] login page snippet:', loginHtml.slice(0, 500));
 
     const loginForm =
       $('form.woocommerce-form-login').length
@@ -47,7 +51,11 @@ export default async function handler(req, res) {
       ...hiddenFields,
     });
 
-    const { text: responseHtml, cookies } = await fetchFollowing(
+    console.log('[login][debug] formAction:', formAction);
+    console.log('[login][debug] hiddenFields:', JSON.stringify(hiddenFields));
+    console.log('[login][debug] cookieJar before POST:', JSON.stringify(cookieJar));
+
+    const { text: responseHtml, cookies, res: postRes } = await fetchFollowing(
       formAction,
       {
         method: 'POST',
@@ -61,6 +69,10 @@ export default async function handler(req, res) {
       cookieJar
     );
 
+    console.log('[login][debug] POST result status:', postRes.status, postRes.url);
+    console.log('[login][debug] response length:', responseHtml.length);
+    console.log('[login][debug] response snippet:', responseHtml.slice(0, 800));
+
     // Verify login success: logged-in page has logout link but no login form
     const loginSuccess =
       (responseHtml.includes('logout') ||
@@ -73,6 +85,7 @@ export default async function handler(req, res) {
       const errorMsg =
         $resp('.woocommerce-error li').first().text().trim() ||
         'Invalid username or password';
+      console.log('[login][debug] scraped WooCommerce error:', errorMsg);
       return res.status(401).json({ error: errorMsg });
     }
 
