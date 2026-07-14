@@ -39,7 +39,7 @@ export default async function handler(req, res) {
     });
 
     // Step 2: POST credentials + hidden fields
-    const formAction = loginForm.attr('action') || LOGIN_URL;
+    const formAction = new URL(loginForm.attr('action') || LOGIN_URL, LOGIN_URL).href;
     const formData = new URLSearchParams({
       username,
       password,
