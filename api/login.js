@@ -1,5 +1,8 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, extractCookies, cookieHeader, fetchFollowing } from './_utils.js';
+import { BASE_URL, USER_AGENT, extractCookies, cookieHeader, fetchFollowing, isSecurityBlockPage } from './_utils.js';
+
+const BLOCKED_MESSAGE =
+  "The cafeteria site's security is currently blocking sign-in attempts from our server. This isn't a wrong password — please try again later or contact the site administrator if it persists.";
 
 const LOGIN_URL = `${BASE_URL}/my-account/`;
 
@@ -17,14 +20,15 @@ export default async function handler(req, res) {
     const cookieJar = {};
 
     // Step 1: GET login page — follow redirects so we always land on the actual form
-    const { text: loginHtml, res: loginPageRes } = await fetchFollowing(LOGIN_URL, {
+    const { text: loginHtml } = await fetchFollowing(LOGIN_URL, {
       headers: { 'User-Agent': USER_AGENT },
     }, cookieJar);
-    const $ = load(loginHtml);
 
-    console.log('[login][debug] GET login page status:', loginPageRes.status, loginPageRes.url);
-    console.log('[login][debug] login page length:', loginHtml.length);
-    console.log('[login][debug] login page snippet:', loginHtml.slice(0, 500));
+    if (isSecurityBlockPage(loginHtml)) {
+      return res.status(503).json({ error: BLOCKED_MESSAGE });
+    }
+
+    const $ = load(loginHtml);
 
     const loginForm =
       $('form.woocommerce-form-login').length
@@ -51,11 +55,7 @@ export default async function handler(req, res) {
       ...hiddenFields,
     });
 
-    console.log('[login][debug] formAction:', formAction);
-    console.log('[login][debug] hiddenFields:', JSON.stringify(hiddenFields));
-    console.log('[login][debug] cookieJar before POST:', JSON.stringify(cookieJar));
-
-    const { text: responseHtml, cookies, res: postRes } = await fetchFollowing(
+    const { text: responseHtml, cookies } = await fetchFollowing(
       formAction,
       {
         method: 'POST',
@@ -69,9 +69,9 @@ export default async function handler(req, res) {
       cookieJar
     );
 
-    console.log('[login][debug] POST result status:', postRes.status, postRes.url);
-    console.log('[login][debug] response length:', responseHtml.length);
-    console.log('[login][debug] response snippet:', responseHtml.slice(0, 800));
+    if (isSecurityBlockPage(responseHtml)) {
+      return res.status(503).json({ error: BLOCKED_MESSAGE });
+    }
 
     // Verify login success: logged-in page has logout link but no login form
     const loginSuccess =
@@ -85,7 +85,6 @@ export default async function handler(req, res) {
       const errorMsg =
         $resp('.woocommerce-error li').first().text().trim() ||
         'Invalid username or password';
-      console.log('[login][debug] scraped WooCommerce error:', errorMsg);
       return res.status(401).json({ error: errorMsg });
     }
 
