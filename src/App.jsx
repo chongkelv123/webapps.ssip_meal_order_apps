@@ -10,6 +10,7 @@ import SettingsPage from './pages/SettingsPage.jsx';
 import AboutPage from './pages/AboutPage.jsx';
 import ContactPage from './pages/ContactPage.jsx';
 import BottomNav from './components/BottomNav.jsx';
+import AnnouncementBanner from './components/AnnouncementBanner.jsx';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -82,6 +83,7 @@ export default function App() {
         <BrowserRouter>
           <AuthProvider>
             <ToastProvider>
+              <AnnouncementBanner />
               <Routes>
                 <Route path="/login" element={<LoginPage />} />
                 <Route path="/about" element={<AboutPage />} />
