@@ -24,7 +24,7 @@ export default function AnnouncementBanner() {
 
   return (
     <div className="bg-amber-50 text-amber-800 text-sm px-4 py-2.5 flex items-center justify-center gap-3">
-      <span>⚠️ The cafeteria site is currently blocking sign-in attempts from our web app. This is not a wrong password — we're working on it.</span>
+      <span>⚠️ The cafeteria site is currently blocking sign-in attempts from our web app, so login may fail regardless of your password.</span>
       <button
         onClick={dismiss}
         aria-label="Dismiss notice"
