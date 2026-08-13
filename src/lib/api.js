@@ -49,7 +49,38 @@ export const getMeals = (date) => post('/api/meals', { date });
 
 export const getOrders = (page = 1) => post('/api/orders', { page });
 
-export const getDashboard = () => post('/api/dashboard');
+// ─── Dashboard user settings ─────────────────────────────────────────────────
+
+const DASHBOARD_SETTINGS_KEY = 'ssip_dashboard_settings';
+
+/**
+ * Reads budget/allowance settings from localStorage. Falls back to the same
+ * defaults the Android app uses so the dashboard works out of the box without
+ * requiring the user to open Settings first.
+ */
+function getDashboardSettings() {
+  const defaults = {
+    missedMealRate: 4.50,
+    monthlyBudget: 100.00,
+    budgetEnabled: true,
+    exemptDates: [],
+  };
+  const stored = localStorage.getItem(DASHBOARD_SETTINGS_KEY);
+  if (!stored) return defaults;
+  try {
+    const p = JSON.parse(stored);
+    return {
+      missedMealRate: typeof p.missedMealRate === 'number' ? p.missedMealRate : defaults.missedMealRate,
+      monthlyBudget:  typeof p.monthlyBudget  === 'number' ? p.monthlyBudget  : defaults.monthlyBudget,
+      budgetEnabled:  typeof p.budgetEnabled  === 'boolean'? p.budgetEnabled  : defaults.budgetEnabled,
+      exemptDates:    Array.isArray(p.exemptDates)         ? p.exemptDates    : defaults.exemptDates,
+    };
+  } catch {
+    return defaults;
+  }
+}
+
+export const getDashboard = () => post('/api/dashboard', getDashboardSettings());
 
 export const placeOrder = (productId, date, orderDetails) =>
   post('/api/place-order', { productId, date, orderDetails });
