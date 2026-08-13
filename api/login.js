@@ -1,5 +1,8 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, extractCookies, cookieHeader, fetchFollowing } from './_utils.js';
+import { BASE_URL, USER_AGENT, extractCookies, cookieHeader, fetchFollowing, isSecurityBlockPage } from './_utils.js';
+
+const BLOCKED_MESSAGE =
+  "The cafeteria site's security is currently blocking sign-in attempts from our server. This isn't a wrong password — please try again later or contact the site administrator if it persists.";
 
 const LOGIN_URL = `${BASE_URL}/my-account/`;
 
@@ -20,6 +23,11 @@ export default async function handler(req, res) {
     const { text: loginHtml } = await fetchFollowing(LOGIN_URL, {
       headers: { 'User-Agent': USER_AGENT },
     }, cookieJar);
+
+    if (isSecurityBlockPage(loginHtml)) {
+      return res.status(503).json({ error: BLOCKED_MESSAGE });
+    }
+
     const $ = load(loginHtml);
 
     const loginForm =
@@ -60,6 +68,10 @@ export default async function handler(req, res) {
       },
       cookieJar
     );
+
+    if (isSecurityBlockPage(responseHtml)) {
+      return res.status(503).json({ error: BLOCKED_MESSAGE });
+    }
 
     // Verify login success: logged-in page has logout link but no login form
     const loginSuccess =

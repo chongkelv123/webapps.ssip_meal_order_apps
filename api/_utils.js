@@ -121,3 +121,11 @@ export function dateToUnixTimestamp(dateStr) {
 export function jsonError(res, status, message, sessionExpired = false) {
   return res.status(status).json({ error: message, sessionExpired });
 }
+
+/**
+ * Detect the WordPress/WooCommerce site's firewall block page (returned
+ * instead of the real page when it rejects the request's source IP).
+ */
+export function isSecurityBlockPage(html) {
+  return html.includes('Your access to this site has been limited by the site owner');
+}
