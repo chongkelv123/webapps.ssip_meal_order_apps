@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDashboard, cancelOrder } from '../lib/api.js';
+import { getDailyMessage, getDailyBannerColor } from '../lib/dailyMessages.js';
 import LoadingSpinner from '../components/LoadingSpinner.jsx';
 import { format, parseISO } from 'date-fns';
 
@@ -118,10 +119,8 @@ export default function DashboardPage() {
         </div>
 
         {/* Banner */}
-        <div className="bg-blue-600 rounded-2xl px-4 py-3">
-          <p className="text-white text-sm font-medium leading-snug">
-            Eat all you want lah. We handle the orders, you handle your weight. 😄
-          </p>
+        <div className={`${getDailyBannerColor()} rounded-2xl px-4 py-3`}>
+          <p className="text-white text-sm font-medium leading-snug">{getDailyMessage()}</p>
         </div>
 
         {/* Spend tiles — top, like Android */}
