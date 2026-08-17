@@ -232,9 +232,15 @@ function extractOrdersFromHtml(html) {
 
 // ─── Pagination ──────────────────────────────────────────────────────────────
 
+const MAX_PAGES  = 50;
+const BATCH_SIZE = 5; // pages fetched concurrently per wave
+
 /**
- * Fetches pages 2+ and stops early once two consecutive pages contain no
- * orders on or after billingPeriodStart.
+ * Fetches pages 2+ in concurrent batches (waves of BATCH_SIZE) and stops
+ * once two consecutive pages (in page order) contain no orders on or after
+ * billingPeriodStart. Fetching a whole wave in parallel turns what used to
+ * be one network round-trip per page into one round-trip per batch, which is
+ * the dominant cost for accounts with multi-page order history.
  *
  * Using billingPeriodStart (the 27th of last month) rather than the calendar
  * month ensures we never stop before we have all the orders the dashboard
@@ -242,32 +248,73 @@ function extractOrdersFromHtml(html) {
  */
 async function fetchRemainingPages(cookies, billingPeriodStart) {
   const allOrders = [];
-  let page = 2;
-  let consecutiveOutOfRange = 0;
-  const MAX_PAGES = 50;
   const cookieStr = Object.keys(cookies).length ? cookieHeader(cookies) : '';
 
-  while (page <= MAX_PAGES) {
-    const url = `${BASE_URL}/orders/${page}/`;
-    const res = await fetch(url, {
-      headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
-    });
-    if (!res.ok) break;
+  let page = 2;
+  let consecutiveOutOfRange = 0;
+  let done = false;
 
-    const html                    = await res.text();
-    const { orders, hasNextPage } = extractOrdersFromHtml(html);
-    if (orders.length === 0) break;
+  while (page <= MAX_PAGES && !done) {
+    const batchPages = [];
+    for (let p = page; p < page + BATCH_SIZE && p <= MAX_PAGES; p++) batchPages.push(p);
 
-    allOrders.push(...orders);
+    const batchResults = await Promise.all(
+      batchPages.map((p) =>
+        fetch(`${BASE_URL}/orders/${p}/`, {
+          headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
+        }).then(async (res) => (res.ok ? { ok: true, html: await res.text() } : { ok: false }))
+      )
+    );
 
-    const hasPeriodOrders = orders.some(o => o.date >= billingPeriodStart);
-    consecutiveOutOfRange = hasPeriodOrders ? 0 : consecutiveOutOfRange + 1;
-    if (consecutiveOutOfRange >= 2) break;
-    if (!hasNextPage) break;
-    page++;
+    // Process in page order so the "two consecutive out-of-range pages" stop
+    // condition behaves identically to the old one-page-at-a-time loop.
+    for (const result of batchResults) {
+      if (!result.ok) { done = true; break; }
+
+      const { orders, hasNextPage } = extractOrdersFromHtml(result.html);
+      if (orders.length === 0) { done = true; break; }
+
+      allOrders.push(...orders);
+
+      const hasPeriodOrders = orders.some(o => o.date >= billingPeriodStart);
+      consecutiveOutOfRange = hasPeriodOrders ? 0 : consecutiveOutOfRange + 1;
+      if (consecutiveOutOfRange >= 2 || !hasNextPage) { done = true; break; }
+    }
+
+    page += BATCH_SIZE;
   }
 
   return allOrders;
+}
+
+// ─── Scrape cache ─────────────────────────────────────────────────────────────
+//
+// Best-effort cache for the expensive part (wallet balance + full order
+// history scrape), keyed by session cookie string. Only helps when Vercel
+// reuses a warm lambda instance for a later request, but that's common for
+// back-to-back navigations right after login. Derived stats (budget,
+// missed-meal classification) are always recomputed fresh from the current
+// request's params, so cached entries can't return stale budget/exempt-date
+// results.
+const scrapeCache  = new Map();
+const CACHE_TTL_MS = 60 * 1000;
+const CACHE_MAX_ENTRIES = 200;
+
+function getCachedScrape(key) {
+  const entry = scrapeCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.timestamp > CACHE_TTL_MS) {
+    scrapeCache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCachedScrape(key, data) {
+  scrapeCache.set(key, { data, timestamp: Date.now() });
+  if (scrapeCache.size > CACHE_MAX_ENTRIES) {
+    scrapeCache.delete(scrapeCache.keys().next().value);
+  }
 }
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
@@ -295,46 +342,58 @@ export default async function handler(req, res) {
     const { start: billingPeriodStart, end: billingPeriodEnd, label: billingPeriodLabel } =
       getBillingPeriod(today);
 
-    // Fetch wallet page and first orders page in parallel.
-    const [walletRes, ordersRes] = await Promise.all([
-      fetch(`${BASE_URL}/woo-wallet/`, {
-        headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
-      }),
-      fetch(`${BASE_URL}/orders/`, {
-        headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
-      }),
-    ]);
+    const cacheKey = cookieStr || null;
+    const cached   = cacheKey ? getCachedScrape(cacheKey) : null;
 
-    if (walletRes.status === 302 || ordersRes.status === 302) {
-      return jsonError(res, 401, 'Session expired', true);
+    let walletBalanceRaw, allOrders;
+
+    if (cached) {
+      ({ walletBalanceRaw, allOrders } = cached);
+    } else {
+      // Fetch wallet page and first orders page in parallel.
+      const [walletRes, ordersRes] = await Promise.all([
+        fetch(`${BASE_URL}/woo-wallet/`, {
+          headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
+        }),
+        fetch(`${BASE_URL}/orders/`, {
+          headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
+        }),
+      ]);
+
+      if (walletRes.status === 302 || ordersRes.status === 302) {
+        return jsonError(res, 401, 'Session expired', true);
+      }
+
+      const walletHtml = await walletRes.text();
+      const ordersHtml = await ordersRes.text();
+
+      if (walletHtml.includes('woocommerce-form-login')) {
+        return jsonError(res, 401, 'Session expired', true);
+      }
+
+      walletBalanceRaw = extractWalletBalance(walletHtml);
+
+      const { orders: page1Orders, hasNextPage } = extractOrdersFromHtml(ordersHtml);
+      allOrders = [...page1Orders];
+
+      if (hasNextPage) {
+        const extra = await fetchRemainingPages(cookies, billingPeriodStart);
+        // Keyed on delivery date too, not just orderDate + mealName: a single bulk
+        // checkout books the same meal across many delivery dates, so those fields
+        // alone collide across every day of that order and would wrongly drop all
+        // but the first day seen.
+        const seen  = new Set(allOrders.map(o => `${o.date}|${o.orderDate}|${o.mealName}`));
+        extra.forEach(o => {
+          const key = `${o.date}|${o.orderDate}|${o.mealName}`;
+          if (!seen.has(key)) { seen.add(key); allOrders.push(o); }
+        });
+      }
+
+      if (cacheKey) setCachedScrape(cacheKey, { walletBalanceRaw, allOrders });
     }
 
-    const walletHtml = await walletRes.text();
-    const ordersHtml = await ordersRes.text();
-
-    if (walletHtml.includes('woocommerce-form-login')) {
-      return jsonError(res, 401, 'Session expired', true);
-    }
-
-    const walletBalanceRaw       = extractWalletBalance(walletHtml);
     const walletBalance          = walletBalanceRaw ?? 0;
     const walletBalanceAvailable = walletBalanceRaw !== null;
-
-    const { orders: page1Orders, hasNextPage } = extractOrdersFromHtml(ordersHtml);
-    let allOrders = [...page1Orders];
-
-    if (hasNextPage) {
-      const extra = await fetchRemainingPages(cookies, billingPeriodStart);
-      // Keyed on delivery date too, not just orderDate + mealName: a single bulk
-      // checkout books the same meal across many delivery dates, so those fields
-      // alone collide across every day of that order and would wrongly drop all
-      // but the first day seen.
-      const seen  = new Set(allOrders.map(o => `${o.date}|${o.orderDate}|${o.mealName}`));
-      extra.forEach(o => {
-        const key = `${o.date}|${o.orderDate}|${o.mealName}`;
-        if (!seen.has(key)) { seen.add(key); allOrders.push(o); }
-      });
-    }
 
     // ── Period spend classification ────────────────────────────────────────────
     const { collectedCharges, missedDays, upcomingCommitment } = calculatePeriodSpend(
