@@ -325,9 +325,13 @@ export default async function handler(req, res) {
 
     if (hasNextPage) {
       const extra = await fetchRemainingPages(cookies, billingPeriodStart);
-      const seen  = new Set(allOrders.map(o => `${o.orderDate}|${o.mealName}`));
+      // Keyed on delivery date too, not just orderDate + mealName: a single bulk
+      // checkout books the same meal across many delivery dates, so those fields
+      // alone collide across every day of that order and would wrongly drop all
+      // but the first day seen.
+      const seen  = new Set(allOrders.map(o => `${o.date}|${o.orderDate}|${o.mealName}`));
       extra.forEach(o => {
-        const key = `${o.orderDate}|${o.mealName}`;
+        const key = `${o.date}|${o.orderDate}|${o.mealName}`;
         if (!seen.has(key)) { seen.add(key); allOrders.push(o); }
       });
     }
