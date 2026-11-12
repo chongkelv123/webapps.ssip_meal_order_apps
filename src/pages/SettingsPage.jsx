@@ -2,6 +2,17 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../hooks/useAuth.jsx';
 import { useToast } from '../hooks/useToast.jsx';
+import MissedDatePicker from '../components/MissedDatePicker.jsx';
+import { readDashboardCache } from '../lib/dashboardCache.js';
+import {
+  getDayName,
+  getBillingPeriod,
+  sgtDateOf,
+  addExemptDate,
+  addManualMissedDate,
+  removeExemptDate,
+  removeManualMissedDate,
+} from '../lib/dashboardCalc.js';
 import { version as appVersion } from '../../package.json';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -30,7 +41,7 @@ function getOrderDetails() {
 function getDashboardSettings() {
   const stored = localStorage.getItem(DASHBOARD_SETTINGS_KEY);
   if (!stored) {
-    return { missedMealRate: '4.50', monthlyBudget: '100.00', budgetEnabled: true, exemptDates: [] };
+    return { missedMealRate: '4.50', monthlyBudget: '100.00', budgetEnabled: true, exemptDates: [], manualMissedDates: [] };
   }
   try {
     const p = JSON.parse(stored);
@@ -39,9 +50,10 @@ function getDashboardSettings() {
       monthlyBudget:  String(typeof p.monthlyBudget  === 'number' ? p.monthlyBudget  : 100.00),
       budgetEnabled:  typeof p.budgetEnabled === 'boolean' ? p.budgetEnabled : true,
       exemptDates:    Array.isArray(p.exemptDates) ? p.exemptDates : [],
+      manualMissedDates: Array.isArray(p.manualMissedDates) ? p.manualMissedDates : [],
     };
   } catch {
-    return { missedMealRate: '4.50', monthlyBudget: '100.00', budgetEnabled: true, exemptDates: [] };
+    return { missedMealRate: '4.50', monthlyBudget: '100.00', budgetEnabled: true, exemptDates: [], manualMissedDates: [] };
   }
 }
 
@@ -57,19 +69,9 @@ function persistDashboardSettings(settings) {
     monthlyBudget:  isNaN(budget) ? 100.00 : budget,
     budgetEnabled:  settings.budgetEnabled,
     exemptDates:    settings.exemptDates || [],
+    // Must be listed here: this writer persists a fixed set of fields.
+    manualMissedDates: settings.manualMissedDates || [],
   }));
-}
-
-/**
- * Returns the full weekday name for a yyyy-MM-dd date string.
- * Uses UTC noon to prevent any timezone day-boundary shift.
- */
-function getDayName(dateStr) {
-  try {
-    return new Date(dateStr + 'T12:00:00Z').toLocaleDateString('en-US', { weekday: 'long' });
-  } catch {
-    return '';
-  }
 }
 
 // ─── Toggle component ─────────────────────────────────────────────────────────
@@ -129,6 +131,15 @@ export default function SettingsPage() {
   // Show/hide the inline date-input for adding a skipped date.
   const [showAddDate, setShowAddDate] = useState(false);
   const [newExemptDate, setNewExemptDate] = useState('');
+  const [showMissedPicker, setShowMissedPicker] = useState(false);
+
+  // No order data here, so only dates already skipped / marked are blocked.
+  // "Today" uses the clock offset from the last dashboard fetch, if any.
+  const today = sgtDateOf(Date.now() + (readDashboardCache()?.clockOffsetMs ?? 0));
+  const periodStart = getBillingPeriod(today).start;
+  const unavailableMissed = {};
+  for (const d of dashSettings.manualMissedDates) unavailableMissed[d] = 'Already marked missed';
+  for (const d of dashSettings.exemptDates) unavailableMissed[d] = 'Skipped';
 
   /**
    * Saves the numeric/text fields only (rate + budget amount).
@@ -168,10 +179,7 @@ export default function SettingsPage() {
       toast.error('That date is already skipped');
       return;
     }
-    const updated = {
-      ...dashSettings,
-      exemptDates: [...dashSettings.exemptDates, newExemptDate].sort(),
-    };
+    const updated = addExemptDate(dashSettings, newExemptDate); // also drops it from manual
     setDashSettings(updated);
     persistDashboardSettings(updated);
     setNewExemptDate('');
@@ -180,10 +188,21 @@ export default function SettingsPage() {
 
   /** Removing a skipped date commits immediately (mirrors Android's "REMOVE" action). */
   function handleRemoveExemptDate(date) {
-    const updated = {
-      ...dashSettings,
-      exemptDates: dashSettings.exemptDates.filter((d) => d !== date),
-    };
+    const updated = removeExemptDate(dashSettings, date);
+    setDashSettings(updated);
+    persistDashboardSettings(updated);
+  }
+
+  /** Marking a day missed commits immediately; it also drops the date from skipped. */
+  function handleAddMissedDate(date) {
+    const updated = addManualMissedDate(dashSettings, date);
+    setDashSettings(updated);
+    persistDashboardSettings(updated);
+    setShowMissedPicker(false);
+  }
+
+  function handleRemoveMissedDate(date) {
+    const updated = removeManualMissedDate(dashSettings, date);
     setDashSettings(updated);
     persistDashboardSettings(updated);
   }
@@ -445,7 +464,58 @@ export default function SettingsPage() {
             + Add Skipped Date
           </button>
         )}
+
+        {/* ── Marked missed ───────────────────────────────────────────────── */}
+        <div className="border-t border-gray-100 pt-2">
+          <p className="text-sm font-semibold text-gray-800">Marked missed (charged at the no-show rate)</p>
+          <p className="text-xs text-gray-500 mt-1">
+            Use when the app did not detect a day you actually missed.
+          </p>
+        </div>
+
+        {dashSettings.manualMissedDates.length === 0 ? (
+          <p className="text-sm text-gray-400">None</p>
+        ) : (
+          <div className="flex flex-col gap-2">
+            {dashSettings.manualMissedDates.map((date) => (
+              <div
+                key={date}
+                className="flex items-center justify-between bg-gray-50 rounded-xl px-4 py-2.5"
+              >
+                <span className="text-sm text-gray-700">
+                  {date}&nbsp;&bull;&nbsp;{getDayName(date)}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => handleRemoveMissedDate(date)}
+                  className="text-sm font-medium text-red-500 ml-4 flex-shrink-0"
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={() => setShowMissedPicker(true)}
+          className="w-full py-3 border border-gray-300 text-gray-700 font-medium rounded-xl active:bg-gray-50 transition-colors text-sm"
+        >
+          + Add Missed Date
+        </button>
       </form>
+
+      {showMissedPicker && (
+        <MissedDatePicker
+          periodStart={periodStart}
+          today={today}
+          unavailable={unavailableMissed}
+          rate={parseFloat(dashSettings.missedMealRate) || 4.5}
+          onConfirm={handleAddMissedDate}
+          onCancel={() => setShowMissedPicker(false)}
+        />
+      )}
 
       {/* ── Info links ─────────────────────────────────────────────────────── */}
       <div className="border-t border-gray-100 pt-4 flex flex-col gap-2">

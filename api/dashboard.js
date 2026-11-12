@@ -1,163 +1,6 @@
 import { load } from 'cheerio';
 import { BASE_URL, USER_AGENT, cookieHeader, parsePrice, jsonError } from './_utils.js';
-
-// ─── Billing period ──────────────────────────────────────────────────────────
-
-/**
- * Returns the billing period that contains todayStr (yyyy-MM-dd).
- * Periods run from the 27th of one month to the 26th of the next and are
- * labelled by the month they end in (e.g. Jul 27 – Aug 26 → "August 2026").
- *
- * Direct port of DateUtil.getBillingPeriod() / billingPeriodOf() from the
- * Android codebase.
- */
-function getBillingPeriod(todayStr) {
-  const [year, month, day] = todayStr.split('-').map(Number);
-  const CUTOFF = 27;
-  const pad = (n) => String(n).padStart(2, '0');
-
-  let startYear, startMonth, endYear, endMonth;
-
-  if (day >= CUTOFF) {
-    // Period starts this month on the 27th, ends next month on the 26th.
-    startYear  = year;
-    startMonth = month;
-    endYear    = month === 12 ? year + 1 : year;
-    endMonth   = month === 12 ? 1        : month + 1;
-  } else {
-    // Period started last month on the 27th, ends this month on the 26th.
-    startYear  = month === 1 ? year - 1 : year;
-    startMonth = month === 1 ? 12       : month - 1;
-    endYear    = year;
-    endMonth   = month;
-  }
-
-  const start = `${startYear}-${pad(startMonth)}-27`;
-  const end   = `${endYear}-${pad(endMonth)}-26`;
-
-  // Label is the month the period ends in, e.g. "August 2026".
-  const endDate = new Date(Date.UTC(endYear, endMonth - 1, 1));
-  const label   = endDate.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
-
-  return { start, end, label };
-}
-
-// ─── Status helpers (mirrors OrderStatusClassifier.kt) ───────────────────────
-
-const normalizeStatus = (s) => s.toLowerCase().replace(/[-\s]/g, '');
-const isOnHold        = (s) => normalizeStatus(s).includes('onhold');
-const isCompleteMp    = (s) => normalizeStatus(s).includes('completemp');
-
-// ─── Domain helpers ──────────────────────────────────────────────────────────
-
-/**
- * Days in [periodStart, todayStr) with an on-hold booking but no CompleteMP
- * tap-in, excluding exemptDates.
- *
- * Port of OrderScraper.findMissedMealDays().
- */
-function findMissedMealDays(orders, periodStart, todayStr, exemptDates) {
-  const inRange = orders.filter(o => o.date >= periodStart && o.date < todayStr);
-
-  const completedDates = new Set(
-    inRange.filter(o => isCompleteMp(o.status)).map(o => o.date)
-  );
-
-  const bookingsByDate = {};
-  for (const o of inRange) {
-    if (isOnHold(o.status)) {
-      if (!bookingsByDate[o.date]) bookingsByDate[o.date] = [];
-      bookingsByDate[o.date].push(o);
-    }
-  }
-
-  return Object.entries(bookingsByDate)
-    .filter(([date]) => !completedDates.has(date) && !exemptDates.has(date))
-    .map(([date, bookings]) => {
-      // UTC noon avoids any timezone day-boundary shift when deriving the weekday.
-      const dayName = new Date(date + 'T12:00:00Z')
-        .toLocaleDateString('en-US', { weekday: 'long' });
-      return { date, dayName, mealName: bookings[0].mealName, bookedPrice: bookings[0].price };
-    })
-    .sort((a, b) => a.date.localeCompare(b.date));
-}
-
-/**
- * Classifies the spend for a billing period into three buckets:
- *   collectedCharges  – sum of CompleteMP rows
- *   missedDays        – booked days before today with no tap-in
- *   upcomingCommitment – future on-hold bookings (one booking per day)
- *
- * Port of OrderScraper.calculatePeriodSpend().
- */
-function calculatePeriodSpend(orders, start, end, todayStr, exemptDates) {
-  const inPeriod = orders.filter(o => o.date >= start && o.date <= end);
-
-  const collectedCharges = inPeriod
-    .filter(o => isCompleteMp(o.status))
-    .reduce((sum, o) => sum + o.price, 0);
-
-  const missedDays = findMissedMealDays(inPeriod, start, todayStr, exemptDates);
-
-  const completedDates = new Set(
-    inPeriod.filter(o => isCompleteMp(o.status)).map(o => o.date)
-  );
-
-  // One booking per future day — the same "first wins" rule findMissedMealDays uses.
-  const futureByDate = {};
-  for (const o of inPeriod) {
-    if (isOnHold(o.status) && o.date >= todayStr && !completedDates.has(o.date)) {
-      if (!futureByDate[o.date]) futureByDate[o.date] = o;
-    }
-  }
-  const upcomingCommitment = Object.values(futureByDate)
-    .reduce((sum, o) => sum + o.price, 0);
-
-  return { collectedCharges, missedDays, upcomingCommitment };
-}
-
-/**
- * Budget status for one period. All arithmetic is done in whole cents so the
- * "exactly on budget" boundary never produces a false OVER verdict.
- *
- * Port of BudgetCalculator.status() from the Android codebase.
- */
-function computeBudgetStatus(budget, collectedCharges, missedDays, missedMealRate, upcoming, period) {
-  const cents  = (n) => Math.round(n * 100);
-  const dollars = (c) => c / 100;
-
-  const missedDayCount = missedDays.length;
-  const missedCharges  = dollars(missedDayCount * cents(missedMealRate));
-
-  const budgetCents    = cents(budget);
-  const projectedCents = cents(collectedCharges) + cents(missedCharges) + cents(upcoming);
-
-  const fraction = budgetCents > 0
-    ? projectedCents / budgetCents
-    : projectedCents > 0 ? 1.0 : 0.0;
-
-  const NEAR_THRESHOLD = 0.8;
-  const level = projectedCents > budgetCents  ? 'OVER'
-              : budgetCents <= 0              ? 'UNDER'
-              : fraction >= NEAR_THRESHOLD    ? 'NEAR'
-                                             : 'UNDER';
-
-  return {
-    budget,
-    collectedCharges,
-    missedCharges,
-    missedDayCount,
-    missedMealRate,
-    upcoming,
-    projected: dollars(projectedCents),
-    remaining: dollars(Math.max(0, budgetCents - projectedCents)),
-    overBy:    dollars(Math.max(0, projectedCents - budgetCents)),
-    fraction,
-    level,
-    isOver: level === 'OVER',
-    period,
-  };
-}
+import { getBillingPeriod } from '../src/lib/dashboardCalc.js';
 
 // ─── HTML extraction ─────────────────────────────────────────────────────────
 
@@ -253,6 +96,10 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
   let page = 2;
   let consecutiveOutOfRange = 0;
   let done = false;
+  // A scrape is only "complete" if it ended naturally (no more pages / two
+  // out-of-range pages). A failed page, a login-form page or hitting MAX_PAGES
+  // means the rows may be partial, so the client must not persist them.
+  let complete = false;
 
   while (page <= MAX_PAGES && !done) {
     const batchPages = [];
@@ -269,22 +116,22 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
     // Process in page order so the "two consecutive out-of-range pages" stop
     // condition behaves identically to the old one-page-at-a-time loop.
     for (const result of batchResults) {
-      if (!result.ok) { done = true; break; }
+      if (!result.ok || result.html.includes('woocommerce-form-login')) { done = true; break; }
 
       const { orders, hasNextPage } = extractOrdersFromHtml(result.html);
-      if (orders.length === 0) { done = true; break; }
+      if (orders.length === 0) { done = true; complete = true; break; }
 
       allOrders.push(...orders);
 
       const hasPeriodOrders = orders.some(o => o.date >= billingPeriodStart);
       consecutiveOutOfRange = hasPeriodOrders ? 0 : consecutiveOutOfRange + 1;
-      if (consecutiveOutOfRange >= 2 || !hasNextPage) { done = true; break; }
+      if (consecutiveOutOfRange >= 2 || !hasNextPage) { done = true; complete = true; break; }
     }
 
     page += BATCH_SIZE;
   }
 
-  return allOrders;
+  return { orders: allOrders, complete };
 }
 
 // ─── Scrape cache ─────────────────────────────────────────────────────────────
@@ -292,10 +139,8 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
 // Best-effort cache for the expensive part (wallet balance + full order
 // history scrape), keyed by session cookie string. Only helps when Vercel
 // reuses a warm lambda instance for a later request, but that's common for
-// back-to-back navigations right after login. Derived stats (budget,
-// missed-meal classification) are always recomputed fresh from the current
-// request's params, so cached entries can't return stale budget/exempt-date
-// results.
+// back-to-back navigations right after login. Only complete scrapes are
+// cached. This server returns raw rows only; the client derives every figure.
 const scrapeCache  = new Map();
 const CACHE_TTL_MS = 60 * 1000;
 const CACHE_MAX_ENTRIES = 200;
@@ -319,36 +164,30 @@ function setCachedScrape(key, data) {
 
 // ─── Handler ─────────────────────────────────────────────────────────────────
 
+/**
+ * Returns the raw scrape: order rows, wallet balance, the server's SGT "today"
+ * and a `complete` flag. All derived figures (missed days, budget, balances)
+ * are computed client-side from these plus the user's local settings.
+ */
 export default async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
-  const {
-    cookies        = {},
-    missedMealRate = 4.50,
-    monthlyBudget  = 100.00,
-    budgetEnabled  = true,
-    exemptDates    = [],
-  } = req.body || {};
-
+  const { cookies = {} } = req.body || {};
   const cookieStr = Object.keys(cookies).length ? cookieHeader(cookies) : '';
-  const exemptSet = new Set(exemptDates);
 
   try {
     // "Today" in SGT (UTC+8) — the cafeteria is in Singapore/Malaysia.
-    const nowSGT     = new Date(Date.now() + 8 * 60 * 60 * 1000);
-    const today      = nowSGT.toISOString().slice(0, 10);
-    const currentMonth = today.slice(0, 7);
-
-    const { start: billingPeriodStart, end: billingPeriodEnd, label: billingPeriodLabel } =
-      getBillingPeriod(today);
+    const now   = Date.now();
+    const today = new Date(now + 8 * 60 * 60 * 1000).toISOString().slice(0, 10);
+    const { start: billingPeriodStart } = getBillingPeriod(today);
 
     const cacheKey = cookieStr || null;
     const cached   = cacheKey ? getCachedScrape(cacheKey) : null;
 
-    let walletBalanceRaw, allOrders;
+    let walletBalanceRaw, allOrders, complete;
 
     if (cached) {
-      ({ walletBalanceRaw, allOrders } = cached);
+      ({ walletBalanceRaw, allOrders, complete } = cached);
     } else {
       // Fetch wallet page and first orders page in parallel.
       const [walletRes, ordersRes] = await Promise.all([
@@ -367,7 +206,7 @@ export default async function handler(req, res) {
       const walletHtml = await walletRes.text();
       const ordersHtml = await ordersRes.text();
 
-      if (walletHtml.includes('woocommerce-form-login')) {
+      if (walletHtml.includes('woocommerce-form-login') || ordersHtml.includes('woocommerce-form-login')) {
         return jsonError(res, 401, 'Session expired', true);
       }
 
@@ -375,74 +214,31 @@ export default async function handler(req, res) {
 
       const { orders: page1Orders, hasNextPage } = extractOrdersFromHtml(ordersHtml);
       allOrders = [...page1Orders];
+      complete  = ordersRes.ok && walletRes.ok && walletBalanceRaw !== null;
 
       if (hasNextPage) {
         const extra = await fetchRemainingPages(cookies, billingPeriodStart);
+        complete = complete && extra.complete;
         // Keyed on delivery date too, not just orderDate + mealName: a single bulk
         // checkout books the same meal across many delivery dates, so those fields
         // alone collide across every day of that order and would wrongly drop all
         // but the first day seen.
         const seen  = new Set(allOrders.map(o => `${o.date}|${o.orderDate}|${o.mealName}`));
-        extra.forEach(o => {
+        extra.orders.forEach(o => {
           const key = `${o.date}|${o.orderDate}|${o.mealName}`;
           if (!seen.has(key)) { seen.add(key); allOrders.push(o); }
         });
       }
 
-      if (cacheKey) setCachedScrape(cacheKey, { walletBalanceRaw, allOrders });
+      if (cacheKey && complete) setCachedScrape(cacheKey, { walletBalanceRaw, allOrders, complete });
     }
 
-    const walletBalance          = walletBalanceRaw ?? 0;
-    const walletBalanceAvailable = walletBalanceRaw !== null;
-
-    // ── Period spend classification ────────────────────────────────────────────
-    const { collectedCharges, missedDays, upcomingCommitment } = calculatePeriodSpend(
-      allOrders, billingPeriodStart, billingPeriodEnd, today, exemptSet
-    );
-
-    const plannedSpend = upcomingCommitment; // future on-hold bookings = "Planned"
-    const actualSpend  = collectedCharges;   // CompleteMP tap-ins only = "Actual"
-
-    // ── Actual balance ────────────────────────────────────────────────────────
-    const centsOf       = (n) => Math.round(n * 100);
-    const actualBalance =
-      (centsOf(walletBalance) - missedDays.length * centsOf(missedMealRate)) / 100;
-
-    // ── Budget status ─────────────────────────────────────────────────────────
-    const budgetStatus = budgetEnabled
-      ? computeBudgetStatus(
-          monthlyBudget,
-          collectedCharges,
-          missedDays,
-          missedMealRate,
-          upcomingCommitment,
-          { start: billingPeriodStart, end: billingPeriodEnd, label: billingPeriodLabel }
-        )
-      : null;
-
-    // ── Today's meal ──────────────────────────────────────────────────────────
-    const todaysMeal = allOrders.find(o => o.date === today && isOnHold(o.status)) ?? null;
-
-    // ── Upcoming meals (all future on-hold, any date) ─────────────────────────
-    const upcomingMeals = allOrders
-      .filter(o => o.date > today && isOnHold(o.status))
-      .sort((a, b) => a.date.localeCompare(b.date));
-
     return res.status(200).json({
-      walletBalance,
-      walletBalanceAvailable,
-      actualBalance,
-      todaysMeal,
-      upcomingMeals,
-      plannedSpend,
-      actualSpend,
-      missedMeals: missedDays,
-      missedMealRate,
-      budgetStatus,
-      currentMonth,
-      billingPeriodStart,
-      billingPeriodEnd,
-      billingPeriodLabel,
+      orders: allOrders,
+      walletBalance: walletBalanceRaw, // number, or null when the page had no readable balance
+      today,
+      serverTime: now,
+      complete,
     });
   } catch (err) {
     console.error('[dashboard]', err);

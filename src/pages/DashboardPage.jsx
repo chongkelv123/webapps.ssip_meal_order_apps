@@ -1,9 +1,21 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { getDashboard, cancelOrder } from '../lib/api.js';
+import { readDashboardCache } from '../lib/dashboardCache.js';
+import { loadDashboardSettings, saveDashboardSettings } from '../lib/dashboardSettings.js';
+import {
+  computeDashboard,
+  sgtDateOf,
+  addExemptDate,
+  addManualMissedDate,
+  removeManualMissedDate,
+  restoreDateMembership,
+} from '../lib/dashboardCalc.js';
+import { useToast } from '../hooks/useToast.jsx';
+import MissedDatePicker from '../components/MissedDatePicker.jsx';
 import { getDailyMessage, getDailyBannerColor } from '../lib/dailyMessages.js';
 import LoadingSpinner from '../components/LoadingSpinner.jsx';
-import { format, parseISO } from 'date-fns';
+import { format, parseISO, formatDistanceToNow } from 'date-fns';
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -152,13 +164,16 @@ function BudgetCard({ budgetStatus }) {
 /**
  * Collapsible warning banner — mirrors the Android MissedMealsCard composable.
  * Collapsed by default so it does not dominate the screen on every load.
+ * Each row has a kebab menu: auto rows can be dismissed as a false positive
+ * ("Not missed"), manual rows can be removed.
  */
-function MissedMealsBanner({ missedMeals }) {
+function MissedMealsBanner({ missedMeals, onMarkAnother, onNotMissed, onRemoveManual }) {
   const [expanded, setExpanded] = useState(false);
+  const [menuFor, setMenuFor] = useState(null);
   const count = missedMeals.length;
 
   return (
-    <div className="bg-amber-50 border border-amber-200 rounded-2xl overflow-hidden">
+    <div className="bg-amber-50 border border-amber-200 rounded-2xl">
       <button
         onClick={() => setExpanded((v) => !v)}
         className="w-full flex items-center gap-3 px-4 py-3 text-left"
@@ -173,16 +188,56 @@ function MissedMealsBanner({ missedMeals }) {
       {expanded && (
         <div className="px-4 pb-4 flex flex-col gap-2 border-t border-amber-100">
           {missedMeals.map((day) => (
-            <div key={day.date} className="pt-2">
-              <p className="text-xs font-medium text-amber-600">
-                {day.date} &bull; {day.dayName}
-              </p>
-              <p className="text-sm text-amber-900">{day.mealName}</p>
+            <div key={day.date} className="pt-2 flex items-start gap-2 relative">
+              <div className="flex-1 min-w-0">
+                <p className="text-xs font-medium text-amber-600 flex items-center gap-2">
+                  <span>{day.date} &bull; {day.dayName}</span>
+                  {day.isManual && (
+                    <span className="text-[10px] font-bold tracking-wide bg-amber-200 text-amber-800 rounded px-1.5 py-0.5">
+                      MANUAL
+                    </span>
+                  )}
+                </p>
+                <p className="text-sm text-amber-900">{day.mealName}</p>
+              </div>
+              <button
+                type="button"
+                aria-label={`Options for ${day.date}`}
+                onClick={() => setMenuFor(menuFor === day.date ? null : day.date)}
+                className="flex-shrink-0 w-8 h-8 -mr-2 flex items-center justify-center text-amber-700 text-lg rounded-full active:bg-amber-100"
+              >
+                {'⋮'}
+              </button>
+              {menuFor === day.date && (
+                <>
+                  <div className="fixed inset-0 z-10" onClick={() => setMenuFor(null)} />
+                  <div className="absolute right-0 top-9 z-20 bg-white rounded-xl shadow-lg border border-gray-100 py-1 min-w-[12rem]">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMenuFor(null);
+                        if (day.isManual) onRemoveManual(day.date);
+                        else onNotMissed(day.date);
+                      }}
+                      className="w-full text-left px-4 py-2.5 text-sm text-gray-800 active:bg-gray-50"
+                    >
+                      {day.isManual ? 'Remove from missed' : 'Not missed (skip this day)'}
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
           ))}
           <p className="text-xs text-amber-600 mt-1 pt-2 border-t border-amber-100">
             Booked but not collected &mdash; tap your card at the canteen to complete a meal.
           </p>
+          <button
+            type="button"
+            onClick={onMarkAnother}
+            className="w-full py-2.5 border border-amber-400 text-amber-800 text-sm font-medium rounded-xl active:bg-amber-100"
+          >
+            + Mark another day as missed
+          </button>
         </div>
       )}
     </div>
@@ -193,12 +248,28 @@ function MissedMealsBanner({ missedMeals }) {
 
 export default function DashboardPage() {
   const queryClient = useQueryClient();
+  const toast = useToast();
   const [cancelTarget, setCancelTarget] = useState(null);
+  const [showPicker, setShowPicker] = useState(false);
+  const [settings, setSettings] = useState(loadDashboardSettings);
 
-  const { data, isLoading, isError, error, refetch } = useQuery({
+  // Raw rows only; every figure below is derived from them + local settings.
+  // The last complete scrape (if any) paints instantly, then refetches.
+  const { data: raw, isLoading, isError, error, refetch, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['dashboard'],
     queryFn: getDashboard,
+    staleTime: 60 * 1000,
+    initialData: () => readDashboardCache() ?? undefined,
+    initialDataUpdatedAt: () => readDashboardCache()?.fetchedAt,
   });
+
+  // "Today" is the server's SGT date (device clock + measured offset), so it
+  // keeps up with midnight and matches the server's classification.
+  const today = raw ? sgtDateOf(Date.now() + raw.clockOffsetMs) : null;
+  const data = useMemo(
+    () => (raw ? computeDashboard(raw, settings, today) : null),
+    [raw, settings, today]
+  );
 
   const { mutate: doCancel, isPending: isCancelling } = useMutation({
     mutationFn: cancelOrder,
@@ -208,21 +279,60 @@ export default function DashboardPage() {
     },
   });
 
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-64">
-        <LoadingSpinner />
-      </div>
+  // ── Missed-day edits: commit to localStorage, recompute instantly, offer Undo.
+  function commit(next) {
+    saveDashboardSettings(next);
+    setSettings(next);
+  }
+
+  function snapshot(date) {
+    const cur = loadDashboardSettings();
+    return {
+      cur,
+      before: { inExempt: cur.exemptDates.includes(date), inManual: cur.manualMissedDates.includes(date) },
+    };
+  }
+
+  // Undo restores the date's membership in both lists to exactly what it was.
+  function offerUndo(message, date, before) {
+    toast.action(message, 'Undo', () =>
+      commit(restoreDateMembership(loadDashboardSettings(), date, before))
     );
   }
 
-  if (isError) {
+  function markMissed(date) {
+    const { cur, before } = snapshot(date);
+    commit(addManualMissedDate(cur, date));
+    setShowPicker(false);
+    offerUndo(`Marked ${date} as missed`, date, before);
+  }
+
+  function markNotMissed(date) {
+    const { cur, before } = snapshot(date);
+    commit(addExemptDate(cur, date));
+    offerUndo(`${date} will not count as missed`, date, before);
+  }
+
+  function removeManual(date) {
+    const { cur, before } = snapshot(date);
+    commit(removeManualMissedDate(cur, date));
+    offerUndo(`Removed ${date} from missed`, date, before);
+  }
+
+  if (isLoading || !data) {
+    if (isError) {
+      return (
+        <div className="p-6 text-center">
+          <p className="text-red-600 text-sm mb-4">{error.message}</p>
+          <button onClick={() => refetch()} className="text-blue-600 font-medium text-sm">
+            Retry
+          </button>
+        </div>
+      );
+    }
     return (
-      <div className="p-6 text-center">
-        <p className="text-red-600 text-sm mb-4">{error.message}</p>
-        <button onClick={refetch} className="text-blue-600 font-medium text-sm">
-          Retry
-        </button>
+      <div className="flex items-center justify-center h-64">
+        <LoadingSpinner />
       </div>
     );
   }
@@ -240,7 +350,8 @@ export default function DashboardPage() {
     budgetStatus         = null,
     billingPeriodStart,
     billingPeriodEnd,
-  } = data || {};
+    unavailableMissedDates,
+  } = data;
 
   // e.g. "Jul 27 – Aug 26, 2026" — string-split to avoid timezone day-shift.
   const periodDisplay = billingPeriodStart && billingPeriodEnd
@@ -263,6 +374,14 @@ export default function DashboardPage() {
           {periodDisplay && (
             <p className="text-xs text-gray-400 mt-0.5">Billing period: {periodDisplay}</p>
           )}
+          <p className="text-xs text-gray-400 mt-0.5" aria-live="polite">
+            {isFetching
+              ? `Refreshing… (last updated ${formatDistanceToNow(dataUpdatedAt, { addSuffix: true })})`
+              : isError
+                ? <>Couldn&apos;t refresh &mdash; showing last known figures.{' '}
+                    <button onClick={() => refetch()} className="text-blue-600 font-medium">Retry</button></>
+                : `Updated ${formatDistanceToNow(dataUpdatedAt, { addSuffix: true })}`}
+          </p>
         </div>
 
         {/* Daily motivational banner */}
@@ -306,8 +425,21 @@ export default function DashboardPage() {
         </div>
 
         {/* Missed meals collapsible banner */}
-        {missedMeals.length > 0 && (
-          <MissedMealsBanner missedMeals={missedMeals} />
+        {missedMeals.length > 0 ? (
+          <MissedMealsBanner
+            missedMeals={missedMeals}
+            onMarkAnother={() => setShowPicker(true)}
+            onNotMissed={markNotMissed}
+            onRemoveManual={removeManual}
+          />
+        ) : (
+          <button
+            type="button"
+            onClick={() => setShowPicker(true)}
+            className="self-start text-sm font-medium text-blue-600"
+          >
+            + Mark a missed day
+          </button>
         )}
 
         {/* Today's Meal */}
@@ -358,6 +490,17 @@ export default function DashboardPage() {
         )}
 
       </div>
+
+      {showPicker && (
+        <MissedDatePicker
+          periodStart={billingPeriodStart}
+          today={data.today}
+          unavailable={unavailableMissedDates}
+          rate={missedMealRate}
+          onConfirm={markMissed}
+          onCancel={() => setShowPicker(false)}
+        />
+      )}
 
       {/* Cancel confirmation dialog */}
       {cancelTarget && (
