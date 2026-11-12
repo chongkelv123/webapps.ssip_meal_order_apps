@@ -43,16 +43,16 @@ function SpendTile({ title, amount, sub, bgClass }) {
   );
 }
 
-function StatusBadge({ status }) {
-  const norm = status.toLowerCase().replace(/[-\s]/g, '');
-  const isCompleted = norm.includes('completemp') || norm.includes('completed');
+// The booking row keeps its "On hold" status all day, so the raw status says
+// nothing about pickup. The tap-in (CompleteMP) row does.
+function CollectedBadge({ collected }) {
   return (
     <span
       className={`text-xs px-2 py-1 rounded font-medium text-white ${
-        isCompleted ? 'bg-green-500' : 'bg-red-500'
+        collected ? 'bg-green-500' : 'bg-red-500'
       }`}
     >
-      {status}
+      {collected ? 'Collected' : 'Not collected yet'}
     </span>
   );
 }
@@ -342,6 +342,7 @@ export default function DashboardPage() {
     walletBalanceAvailable = true,
     actualBalance        = 0,
     todaysMeal,
+    todaysMealCollected,
     upcomingMeals        = [],
     plannedSpend         = 0,
     actualSpend          = 0,
@@ -449,7 +450,7 @@ export default function DashboardPage() {
             <p className="font-semibold text-gray-900">{todaysMeal.mealName}</p>
             <p className="text-xs text-gray-500 mt-0.5">{fmt(todaysMeal.price ?? 0)}</p>
             <div className="mt-2">
-              <StatusBadge status={todaysMeal.status} />
+              <CollectedBadge collected={todaysMealCollected} />
             </div>
           </div>
         ) : (

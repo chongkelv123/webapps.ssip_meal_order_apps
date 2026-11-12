@@ -336,6 +336,9 @@ export function computeDashboard(raw, settings, today) {
     walletBalanceAvailable,
     actualBalance: computeActualBalance(walletBalance, missedDays.length, settings.missedMealRate),
     todaysMeal: orders.find((o) => o.date === today && isOnHold(o.status)) ?? null,
+    // The booking row stays "On hold" all day; a separate CompleteMP tap-in row
+    // for the same date is what proves the meal was collected.
+    todaysMealCollected: orders.some((o) => o.date === today && isCompleteMp(o.status)),
     upcomingMeals: orders
       .filter((o) => o.date > today && isOnHold(o.status))
       .sort((a, b) => a.date.localeCompare(b.date)),

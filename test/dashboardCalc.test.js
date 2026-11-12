@@ -122,6 +122,21 @@ test('computeDashboard recomputes from raw rows when settings change', () => {
   assert.equal(d.missedMeals.length, 0);
 });
 
+test("today's meal is collected only when a CompleteMP row exists for today", () => {
+  const base = { missedMealRate: 4.5, monthlyBudget: 100, budgetEnabled: true, exemptDates: [], manualMissedDates: [] };
+  const onHold = computeDashboard({ orders: [booked(TODAY)], walletBalance: 10 }, base, TODAY);
+  assert.equal(onHold.todaysMeal.date, TODAY);
+  assert.equal(onHold.todaysMealCollected, false);
+
+  const paid = computeDashboard({ orders: [booked(TODAY), tapped(TODAY)], walletBalance: 10 }, base, TODAY);
+  assert.equal(paid.todaysMeal.date, TODAY); // booking row is still the displayed meal
+  assert.equal(paid.todaysMealCollected, true);
+
+  // a tap-in on another day doesn't count
+  const other = computeDashboard({ orders: [booked(TODAY), tapped('2026-11-11')], walletBalance: 10 }, base, TODAY);
+  assert.equal(other.todaysMealCollected, false);
+});
+
 test('unavailable dates carry reasons, later entries override earlier ones', () => {
   const orders = [tapped('2026-11-02'), booked('2026-11-03'), booked('2026-11-04'), booked(TODAY)];
   const exempt = ['2026-11-04'];

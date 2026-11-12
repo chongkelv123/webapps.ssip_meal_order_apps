@@ -1,12 +1,14 @@
 import { useState, useEffect } from 'react';
+import { useLocation } from 'react-router-dom';
 
 // Bump the id whenever a new notice should ignore prior dismissals.
-const NOTICE_ID = 'login-fixed-2026-07-14';
-const EXPIRES_AT = new Date('2026-07-28T00:00:00');
+const NOTICE_ID = 'server-back-missed-meals-2026-11-12';
+const EXPIRES_AT = new Date('2026-11-26T00:00:00');
 const STORAGE_KEY = `notice_dismissed_${NOTICE_ID}`;
 
 export default function AnnouncementBanner() {
   const [visible, setVisible] = useState(false);
+  const { pathname } = useLocation();
 
   useEffect(() => {
     const dismissed = localStorage.getItem(STORAGE_KEY);
@@ -20,11 +22,12 @@ export default function AnnouncementBanner() {
     setVisible(false);
   }
 
-  if (!visible) return null;
+  // Shown on the dashboard only.
+  if (!visible || pathname !== '/dashboard') return null;
 
   return (
     <div className="bg-emerald-50 text-emerald-800 text-sm px-4 py-2.5 flex items-center justify-center gap-3">
-      <span>✅ Login is working again — the sign-in issue has been fixed. Thanks for your patience!</span>
+      <span>✅ The server is back and getting faster, and you can now mark missed meals or skip a missed meal.</span>
       <button
         onClick={dismiss}
         aria-label="Dismiss notice"
