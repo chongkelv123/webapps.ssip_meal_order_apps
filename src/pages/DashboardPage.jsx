@@ -258,7 +258,7 @@ export default function DashboardPage() {
   const { data: raw, isLoading, isError, error, refetch, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ['dashboard'],
     queryFn: getDashboard,
-    staleTime: 60 * 1000,
+    staleTime: 5 * 60 * 1000, // fewer scrapes of the cafeteria site; the 60s server cache covers repeats
     initialData: () => readDashboardCache() ?? undefined,
     initialDataUpdatedAt: () => readDashboardCache()?.fetchedAt,
   });

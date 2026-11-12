@@ -1,5 +1,12 @@
 export const BASE_URL = 'https://ssip-cafeteria.whew.life';
 
+// Headers a real browser always sends alongside the User-Agent; their absence
+// makes server-side requests look like a bot to firewalls.
+export const BROWSER_HEADERS = {
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+  'Accept-Language': 'en-US,en;q=0.5',
+};
+
 export const USER_AGENT =
   'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
 
@@ -58,6 +65,7 @@ export async function fetchFollowing(url, options = {}, cookieJar = {}, maxRedir
   while (hops < maxRedirects) {
     const headers = {
       'User-Agent': USER_AGENT,
+      ...BROWSER_HEADERS,
       ...options.headers,
     };
     if (Object.keys(cookieJar).length > 0) {

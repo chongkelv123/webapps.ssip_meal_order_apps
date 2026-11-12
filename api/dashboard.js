@@ -1,5 +1,5 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, cookieHeader, parsePrice, jsonError, isSecurityBlockPage } from './_utils.js';
+import { BASE_URL, USER_AGENT, BROWSER_HEADERS, cookieHeader, parsePrice, jsonError, isSecurityBlockPage } from './_utils.js';
 import { getBillingPeriod } from '../src/lib/dashboardCalc.js';
 
 // ─── HTML extraction ─────────────────────────────────────────────────────────
@@ -85,12 +85,23 @@ function looksLikeOrdersPage(html) {
 }
 
 const BLOCKED_MESSAGE =
-  "The cafeteria site is blocking requests from our server right now, so your meals can't be refreshed. Your last known figures are shown. Please try again later.";
+  "The cafeteria site is blocking requests from our server right now, so your meals can't be refreshed. Please try again later.";
+
+// ─── Block back-off ──────────────────────────────────────────────────────────
+//
+// Once the site's firewall has blocked us, every further request (from every
+// user's retry) can prolong the block. Remember it and answer straight away
+// for a few minutes without contacting the site. Best-effort: per warm instance.
+const BLOCK_BACKOFF_MS = 5 * 60 * 1000;
+let blockedUntil = 0;
+
+/** Test hook: clears the back-off. */
+export function resetBlockBackoff() { blockedUntil = 0; }
 
 // ─── Pagination ──────────────────────────────────────────────────────────────
 
 const MAX_PAGES  = 50;
-const BATCH_SIZE = 5; // pages fetched concurrently per wave
+const BATCH_SIZE = 2; // pages fetched concurrently per wave (kept small: bursts trip the site's firewall)
 
 /**
  * Fetches pages 2+ in concurrent batches (waves of BATCH_SIZE) and stops
@@ -114,6 +125,7 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
   // out-of-range pages). A failed page, a login-form page or hitting MAX_PAGES
   // means the rows may be partial, so the client must not persist them.
   let complete = false;
+  let blocked = false;
 
   while (page <= MAX_PAGES && !done) {
     const batchPages = [];
@@ -122,7 +134,7 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
     const batchResults = await Promise.all(
       batchPages.map((p) =>
         fetch(`${BASE_URL}/orders/${p}/`, {
-          headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
+          headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
         }).then(async (res) => (res.ok ? { ok: true, html: await res.text() } : { ok: false }))
       )
     );
@@ -130,6 +142,7 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
     // Process in page order so the "two consecutive out-of-range pages" stop
     // condition behaves identically to the old one-page-at-a-time loop.
     for (const result of batchResults) {
+      if (result.ok && isSecurityBlockPage(result.html)) blocked = true;
       if (!result.ok || result.html.includes('woocommerce-form-login') || isSecurityBlockPage(result.html)) { done = true; break; }
 
       const { orders, hasNextPage } = extractOrdersFromHtml(result.html);
@@ -145,7 +158,7 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
     page += BATCH_SIZE;
   }
 
-  return { orders: allOrders, complete };
+  return { orders: allOrders, complete, blocked };
 }
 
 // ─── Scrape cache ─────────────────────────────────────────────────────────────
@@ -198,6 +211,10 @@ export default async function handler(req, res) {
     const cacheKey = cookieStr || null;
     const cached   = cacheKey ? getCachedScrape(cacheKey) : null;
 
+    if (!cached && Date.now() < blockedUntil) {
+      return jsonError(res, 503, BLOCKED_MESSAGE);
+    }
+
     let walletBalanceRaw, allOrders, complete;
 
     if (cached) {
@@ -206,10 +223,10 @@ export default async function handler(req, res) {
       // Fetch wallet page and first orders page in parallel.
       const [walletRes, ordersRes] = await Promise.all([
         fetch(`${BASE_URL}/woo-wallet/`, {
-          headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
+          headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
         }),
         fetch(`${BASE_URL}/orders/`, {
-          headers: { 'User-Agent': USER_AGENT, ...(cookieStr ? { Cookie: cookieStr } : {}) },
+          headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
         }),
       ]);
 
@@ -225,6 +242,7 @@ export default async function handler(req, res) {
       }
 
       if (isSecurityBlockPage(walletHtml) || isSecurityBlockPage(ordersHtml)) {
+        blockedUntil = Date.now() + BLOCK_BACKOFF_MS;
         console.error('[dashboard] firewall block page', { walletStatus: walletRes.status, ordersStatus: ordersRes.status });
         return jsonError(res, 503, BLOCKED_MESSAGE);
       }
@@ -238,7 +256,7 @@ export default async function handler(req, res) {
         };
         console.error('[dashboard] unexpected orders page', debug);
         return res.status(502).json({
-          error: "The cafeteria site returned an unexpected page, so your meals can't be refreshed. Your last known figures are shown.",
+          error: "The cafeteria site returned an unexpected page, so your meals can't be refreshed right now.",
           sessionExpired: false,
           debug,
         });
@@ -253,6 +271,7 @@ export default async function handler(req, res) {
       if (hasNextPage) {
         const extra = await fetchRemainingPages(cookies, billingPeriodStart);
         complete = complete && extra.complete;
+        if (extra.blocked) blockedUntil = Date.now() + BLOCK_BACKOFF_MS;
         // Keyed on delivery date too, not just orderDate + mealName: a single bulk
         // checkout books the same meal across many delivery dates, so those fields
         // alone collide across every day of that order and would wrongly drop all

@@ -1,6 +1,6 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import handler from '../api/dashboard.js';
+import handler, { resetBlockBackoff } from '../api/dashboard.js';
 
 const BLOCK = '<html><body>Your access to this site has been limited by the site owner</body></html>';
 const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>challenge</body></html>';
@@ -15,9 +15,11 @@ const ORDERS = `<table class="woocommerce-orders-table"><tbody><tr>
 const NO_ORDERS = '<div class="woocommerce-info">No order has been made yet.</div>';
 
 let n = 0;
+let fetchCalls = [];
 const call = async (walletHtml, ordersHtml, ordersStatus = 200) => {
-  globalThis.fetch = async (url) =>
-    url.includes('woo-wallet')
+  fetchCalls = [];
+  globalThis.fetch = async (url, init) =>
+    (fetchCalls.push({ url, headers: init?.headers ?? {} }), url.includes('woo-wallet'))
       ? { ok: true, status: 200, text: async () => walletHtml }
       : { ok: ordersStatus < 400, status: ordersStatus, text: async () => ordersHtml };
   let out;
@@ -26,7 +28,7 @@ const call = async (walletHtml, ordersHtml, ordersStatus = 200) => {
   return out;
 };
 
-beforeEach(() => { console.error = () => {}; });
+beforeEach(() => { console.error = () => {}; resetBlockBackoff(); });
 
 test('a firewall block page is an error, not an empty meal list', async () => {
   const r = await call(WALLET, BLOCK);
@@ -53,4 +55,24 @@ test('a genuinely empty account is still a valid empty list', async () => {
   const r = await call(WALLET, NO_ORDERS);
   assert.equal(r.status, 200);
   assert.deepEqual(r.body.orders, []);
+});
+
+test('after a block, further requests are answered without contacting the site', async () => {
+  const first = await call(WALLET, BLOCK);
+  assert.equal(first.status, 503);
+  assert.ok(fetchCalls.length > 0);
+
+  const second = await call(WALLET, ORDERS); // site would now be fine, but we back off
+  assert.equal(second.status, 503);
+  assert.equal(fetchCalls.length, 0);
+});
+
+test('requests to the site carry browser-like headers', async () => {
+  await call(WALLET, ORDERS);
+  assert.ok(fetchCalls.length >= 2);
+  for (const c of fetchCalls) {
+    assert.ok(c.headers['Accept']);
+    assert.ok(c.headers['Accept-Language']);
+    assert.ok(c.headers['User-Agent']);
+  }
 });
