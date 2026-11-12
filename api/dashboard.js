@@ -1,5 +1,5 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, cookieHeader, parsePrice, jsonError } from './_utils.js';
+import { BASE_URL, USER_AGENT, cookieHeader, parsePrice, jsonError, isSecurityBlockPage } from './_utils.js';
 import { getBillingPeriod } from '../src/lib/dashboardCalc.js';
 
 // ─── HTML extraction ─────────────────────────────────────────────────────────
@@ -73,6 +73,20 @@ function extractOrdersFromHtml(html) {
   return { orders, hasNextPage };
 }
 
+/**
+ * True when the page looks like the real order list (a table of orders, or
+ * WooCommerce's "no orders yet" notice). Anything else (a firewall page, a
+ * challenge page, an error page) must not be mistaken for "zero orders", or
+ * the client would replace good meals with an empty list.
+ */
+function looksLikeOrdersPage(html) {
+  const $ = load(html);
+  return $('table.woocommerce-orders-table').length > 0 || $('.woocommerce-info').length > 0;
+}
+
+const BLOCKED_MESSAGE =
+  "The cafeteria site is blocking requests from our server right now, so your meals can't be refreshed. Your last known figures are shown. Please try again later.";
+
 // ─── Pagination ──────────────────────────────────────────────────────────────
 
 const MAX_PAGES  = 50;
@@ -116,7 +130,7 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
     // Process in page order so the "two consecutive out-of-range pages" stop
     // condition behaves identically to the old one-page-at-a-time loop.
     for (const result of batchResults) {
-      if (!result.ok || result.html.includes('woocommerce-form-login')) { done = true; break; }
+      if (!result.ok || result.html.includes('woocommerce-form-login') || isSecurityBlockPage(result.html)) { done = true; break; }
 
       const { orders, hasNextPage } = extractOrdersFromHtml(result.html);
       if (orders.length === 0) { done = true; complete = true; break; }
@@ -208,6 +222,26 @@ export default async function handler(req, res) {
 
       if (walletHtml.includes('woocommerce-form-login') || ordersHtml.includes('woocommerce-form-login')) {
         return jsonError(res, 401, 'Session expired', true);
+      }
+
+      if (isSecurityBlockPage(walletHtml) || isSecurityBlockPage(ordersHtml)) {
+        console.error('[dashboard] firewall block page', { walletStatus: walletRes.status, ordersStatus: ordersRes.status });
+        return jsonError(res, 503, BLOCKED_MESSAGE);
+      }
+      if (!ordersRes.ok || !looksLikeOrdersPage(ordersHtml)) {
+        // Surface what we actually got so the cause is visible in the Network tab / Vercel logs.
+        const debug = {
+          walletStatus: walletRes.status,
+          ordersStatus: ordersRes.status,
+          ordersBytes: ordersHtml.length,
+          ordersTitle: (ordersHtml.match(/<title>([^<]*)<\/title>/i) || [])[1] || null,
+        };
+        console.error('[dashboard] unexpected orders page', debug);
+        return res.status(502).json({
+          error: "The cafeteria site returned an unexpected page, so your meals can't be refreshed. Your last known figures are shown.",
+          sessionExpired: false,
+          debug,
+        });
       }
 
       walletBalanceRaw = extractWalletBalance(walletHtml);

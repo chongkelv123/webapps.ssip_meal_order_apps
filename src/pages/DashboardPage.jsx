@@ -379,7 +379,7 @@ export default function DashboardPage() {
             {isFetching
               ? `Refreshing… (last updated ${formatDistanceToNow(dataUpdatedAt, { addSuffix: true })})`
               : isError
-                ? <>Couldn&apos;t refresh &mdash; showing last known figures.{' '}
+                ? <>{error?.message || 'Couldn’t refresh — showing last known figures.'}{' '}
                     <button onClick={() => refetch()} className="text-blue-600 font-medium">Retry</button></>
                 : `Updated ${formatDistanceToNow(dataUpdatedAt, { addSuffix: true })}`}
           </p>
