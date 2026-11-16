@@ -48,7 +48,17 @@ async function egressIp() {
  */
 async function handler(req, res) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
-  if (!tokenOk(req.query?.token)) return res.status(404).json({ error: 'Not found' });
+  if (!tokenOk(req.query?.token)) {
+    // Log why (never the token itself) so a refused call can be debugged from Vercel logs.
+    const given = req.query?.token;
+    console.error('[diag] denied', {
+      envConfigured: Boolean(process.env.DIAG_TOKEN),
+      tokenGiven: typeof given === 'string' && given.length > 0,
+      givenLength: typeof given === 'string' ? given.length : 0,
+      expectedLength: (process.env.DIAG_TOKEN || '').length,
+    });
+    return res.status(404).json({ error: 'Not found' });
+  }
 
   const cached = await store.get(CACHE_KEY);
   if (cached) return res.status(200).json({ ...cached, cached: true });
