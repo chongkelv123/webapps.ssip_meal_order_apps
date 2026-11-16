@@ -1,5 +1,5 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, cookieHeader, jsonError, countedFetch, inspectResponse, isSecurityBlockPage, instrument } from './_utils.js';
+import { BASE_URL, jsonError, fetchFollowing, sendIfBlocked, instrument } from './_utils.js';
 
 const MAX_MEALS = 6;
 const MIN_PRICE = 2.0;
@@ -170,20 +170,12 @@ async function handler(req, res) {
 
   try {
     const url = `${BASE_URL}/lunch/?menu-date=${date}`;
-    const response = await countedFetch(url, {
-      headers: {
-        'User-Agent': USER_AGENT,
-        ...(Object.keys(cookies).length ? { Cookie: cookieHeader(cookies) } : {}),
-      },
-    });
+    // Gated by the shared back-off; a firewall block page throws BlockedError.
+    const { res: response, text: html } = await fetchFollowing(url, {}, { ...cookies });
 
     if (!response.ok) {
-      inspectResponse('meals', response.status, await response.text()); // diagnostics only
       return jsonError(res, 502, `WooCommerce returned ${response.status}`);
     }
-
-    const html = await response.text();
-    if (isSecurityBlockPage(html)) inspectResponse('meals', response.status, html); // diagnostics only
 
     // Detect session expiry
     if (html.includes('woocommerce-form-login')) {
@@ -193,6 +185,7 @@ async function handler(req, res) {
     const meals = extractMeals(html);
     return res.status(200).json({ meals });
   } catch (err) {
+    if (sendIfBlocked(res, err)) return;
     console.error('[meals]', err);
     return jsonError(res, 500, 'Server error: ' + err.message);
   }

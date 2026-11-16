@@ -273,9 +273,15 @@ export default function DashboardPage() {
 
   const { mutate: doCancel, isPending: isCancelling } = useMutation({
     mutationFn: cancelOrder,
-    onSuccess: () => {
+    onSuccess: (data) => {
       setCancelTarget(null);
+      if (data?.success) toast.success('Order cancelled');
+      else toast.error('Could not confirm the cancellation. Please check your orders.');
       queryClient.invalidateQueries({ queryKey: ['dashboard'] });
+    },
+    onError: (err) => {
+      setCancelTarget(null);
+      toast.error(err.message);
     },
   });
 
