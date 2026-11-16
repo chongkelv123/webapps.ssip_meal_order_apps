@@ -1,4 +1,6 @@
-export const BASE_URL = 'https://ssip-cafeteria.whew.life';
+import { AsyncLocalStorage } from 'node:async_hooks';
+
+export const BASE_URL ='https://ssip-cafeteria.whew.life';
 
 // Headers a real browser always sends alongside the User-Agent; their absence
 // makes server-side requests look like a bot to firewalls.
@@ -72,7 +74,7 @@ export async function fetchFollowing(url, options = {}, cookieJar = {}, maxRedir
       headers['Cookie'] = cookieHeader(cookieJar);
     }
 
-    const res = await fetch(currentUrl, {
+    const res = await countedFetch(currentUrl, {
       ...options,
       headers,
       redirect: 'manual',
@@ -94,6 +96,9 @@ export async function fetchFollowing(url, options = {}, cookieJar = {}, maxRedir
     }
 
     const text = await res.text();
+
+    // Diagnostics only: logs [wf-block] / [wf-unrecognised]; behaviour unchanged.
+    if (res.status >= 400 || isSecurityBlockPage(text)) inspectResponse(null, res.status, text);
 
     // Session expiry: WooCommerce redirected us to the login page
     const sessionExpired =
@@ -130,10 +135,113 @@ export function jsonError(res, status, message, sessionExpired = false) {
   return res.status(status).json({ error: message, sessionExpired });
 }
 
+// ─── Block-page detection ────────────────────────────────────────────────────
+
+const BLOCK_STATUSES = new Set([403, 429, 503]);
+
+/** Strip HTML to plain text, keeping line breaks at block/cell boundaries. */
+function htmlToLines(html) {
+  return String(html || '')
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, ' ')
+    .replace(/<\/(p|div|tr|td|th|li|h[1-6]|table|ul|ol|dt|dd)>|<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .split('\n')
+    .map((l) => l.replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+}
+
+/**
+ * Inspect a response from the cafeteria site and say whether it is a firewall
+ * block (Wordfence). Returns { blocked, reason, blockedIp, rawSnippet }.
+ *
+ * Detection does not depend on one exact sentence: Wordfence's rate-limit and
+ * lockout pages word things differently. A page is a block when it has the
+ * known banner, or mentions Wordfence / "temporarily limited" on a 403/429/503,
+ * or is a bare 403/429/503 (a *possible* block, reason "http-<status>").
+ * `reason` / `blockedIp` come from the "Block Technical Data" section when present.
+ * rawSnippet is plain text only (no cookies/nonces) so it is safe to log.
+ */
+export function parseBlockPage(html, status = 0) {
+  const lines = htmlToLines(html);
+  const text = lines.join('\n');
+  const rawSnippet = text.replace(/\s+/g, ' ').slice(0, 300);
+
+  const banner = /access to this site has been (limited|temporarily)/i.test(text);
+  const limitedWording = /temporarily limited/i.test(text);
+  const wordfence = /wordfence/i.test(text);
+  const statusBlock = BLOCK_STATUSES.has(status);
+
+  // A bare 403/429/503 counts too (possible block); Wordfence wording just makes it certain.
+  const blocked = banner || statusBlock;
+  if (!blocked) return { blocked: false, reason: null, blockedIp: null, rawSnippet };
+
+  // Only trust the Wordfence field labels when the page really looks like a block page.
+  const reasonM = text.match(/Block(?:ing)?\s+Reason\s*:?\s*\n?\s*([^\n]+)/i);
+  const ipM =
+    text.match(/Your\s+IP\s*:?\s*\n?\s*([0-9a-f:.]{3,45})/i) ||
+    text.match(/\bIP(?:\s+address)?\s*:\s*\n?\s*([0-9a-f:.]{3,45})/i);
+
+  const reason =
+    (reasonM && reasonM[1].trim()) ||
+    (statusBlock && !banner && !wordfence && !limitedWording ? `http-${status}` : 'unparsed');
+
+  return { blocked: true, reason, blockedIp: ipM ? ipM[1] : null, rawSnippet };
+}
+
+/**
+ * Parse a response and log what we found. Blocks -> `[wf-block]`; any other
+ * 4xx/5xx page -> `[wf-unrecognised]` with a snippet so the cause is visible
+ * in Vercel logs. Returns the parsed result.
+ */
+export function inspectResponse(endpoint, status, html) {
+  const parsed = parseBlockPage(html, status);
+  const name = endpoint || currentEndpoint();
+  if (parsed.blocked) {
+    console.error('[wf-block]', { endpoint: name, status, reason: parsed.reason, blockedIp: parsed.blockedIp });
+  } else if (status >= 400) {
+    console.error('[wf-unrecognised]', { endpoint: name, status, rawSnippet: parsed.rawSnippet });
+  }
+  return parsed;
+}
+
 /**
  * Detect the WordPress/WooCommerce site's firewall block page (returned
  * instead of the real page when it rejects the request's source IP).
+ * Body-only check; HTTP status is not considered here.
  */
 export function isSecurityBlockPage(html) {
-  return html.includes('Your access to this site has been limited by the site owner');
+  return parseBlockPage(html, 0).blocked;
+}
+
+// ─── Outbound request counting ───────────────────────────────────────────────
+
+const outboundStore = new AsyncLocalStorage();
+
+function currentEndpoint() {
+  return outboundStore.getStore()?.endpoint || 'unknown';
+}
+
+/**
+ * Wrap an API handler so every request it makes to the cafeteria site (via
+ * countedFetch / fetchFollowing) is counted and logged when the handler ends:
+ * `[outbound] endpoint=meals count=1`.
+ */
+export function instrument(endpoint, handler) {
+  return async function instrumented(req, res) {
+    const store = { endpoint, count: 0 };
+    try {
+      return await outboundStore.run(store, () => handler(req, res));
+    } finally {
+      console.log(`[outbound] endpoint=${endpoint} count=${store.count}`);
+    }
+  };
+}
+
+/** Drop-in for fetch() that counts the call toward the current handler's total. */
+export function countedFetch(url, options) {
+  const store = outboundStore.getStore();
+  if (store) store.count++;
+  return fetch(url, options);
 }

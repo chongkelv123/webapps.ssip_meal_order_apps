@@ -1,5 +1,5 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, cookieHeader, parsePrice, jsonError } from './_utils.js';
+import { BASE_URL, USER_AGENT, cookieHeader, parsePrice, jsonError, countedFetch, inspectResponse, isSecurityBlockPage, instrument } from './_utils.js';
 
 function determineStall(name) {
   const n = name.toLowerCase();
@@ -63,7 +63,7 @@ function extractOrders(html) {
   return { orders, hasNextPage };
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { cookies = {}, page = 1 } = req.body || {};
@@ -72,7 +72,7 @@ export default async function handler(req, res) {
     const url =
       page === 1 ? `${BASE_URL}/orders/` : `${BASE_URL}/orders/${page}/`;
 
-    const response = await fetch(url, {
+    const response = await countedFetch(url, {
       headers: {
         'User-Agent': USER_AGENT,
         ...(Object.keys(cookies).length ? { Cookie: cookieHeader(cookies) } : {}),
@@ -80,10 +80,12 @@ export default async function handler(req, res) {
     });
 
     if (!response.ok) {
+      inspectResponse('orders', response.status, await response.text()); // diagnostics only
       return jsonError(res, 502, `WooCommerce returned ${response.status}`);
     }
 
     const html = await response.text();
+    if (isSecurityBlockPage(html)) inspectResponse('orders', response.status, html); // diagnostics only
 
     if (html.includes('woocommerce-form-login')) {
       return jsonError(res, 401, 'Session expired', true);
@@ -96,3 +98,5 @@ export default async function handler(req, res) {
     return jsonError(res, 500, 'Server error: ' + err.message);
   }
 }
+
+export default instrument('orders', handler);

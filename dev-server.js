@@ -10,6 +10,7 @@ import ordersHandler from './api/orders.js';
 import dashboardHandler from './api/dashboard.js';
 import placeOrderHandler from './api/place-order.js';
 import cancelOrderHandler from './api/cancel-order.js';
+import diagHandler from './api/diag.js';
 
 const PORT = 3001;
 
@@ -20,6 +21,7 @@ const routes = {
   '/api/dashboard': dashboardHandler,
   '/api/place-order': placeOrderHandler,
   '/api/cancel-order': cancelOrderHandler,
+  '/api/diag': diagHandler,
 };
 
 function makeRes(nodeRes) {
@@ -49,6 +51,7 @@ const server = http.createServer((req, res) => {
 
   const pathname = new URL(req.url, `http://localhost`).pathname;
   const handler = routes[pathname];
+  req.query = Object.fromEntries(new URL(req.url, 'http://localhost').searchParams);
 
   if (!handler) {
     res.writeHead(404, { 'Content-Type': 'application/json' });

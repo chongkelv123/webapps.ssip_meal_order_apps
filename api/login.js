@@ -1,12 +1,12 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, extractCookies, cookieHeader, fetchFollowing, isSecurityBlockPage } from './_utils.js';
+import { BASE_URL, USER_AGENT, extractCookies, cookieHeader, fetchFollowing, isSecurityBlockPage, instrument } from './_utils.js';
 
 const BLOCKED_MESSAGE =
   "The cafeteria site's security is currently blocking sign-in attempts from our server. This isn't a wrong password — please try again later or contact the site administrator if it persists.";
 
 const LOGIN_URL = `${BASE_URL}/my-account/`;
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed' });
   }
@@ -94,3 +94,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Server error: ' + err.message });
   }
 }
+
+export default instrument('login', handler);

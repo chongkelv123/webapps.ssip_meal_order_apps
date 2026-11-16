@@ -1,5 +1,5 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, BROWSER_HEADERS, cookieHeader, parsePrice, jsonError, isSecurityBlockPage } from './_utils.js';
+import { BASE_URL, USER_AGENT, BROWSER_HEADERS, cookieHeader, parsePrice, jsonError, isSecurityBlockPage, countedFetch, inspectResponse, instrument } from './_utils.js';
 import { getBillingPeriod } from '../src/lib/dashboardCalc.js';
 
 // ─── HTML extraction ─────────────────────────────────────────────────────────
@@ -133,9 +133,13 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
 
     const batchResults = await Promise.all(
       batchPages.map((p) =>
-        fetch(`${BASE_URL}/orders/${p}/`, {
+        countedFetch(`${BASE_URL}/orders/${p}/`, {
           headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
-        }).then(async (res) => (res.ok ? { ok: true, html: await res.text() } : { ok: false }))
+        }).then(async (res) => {
+          if (res.ok) return { ok: true, html: await res.text() };
+          inspectResponse('dashboard', res.status, await res.text()); // diagnostics only
+          return { ok: false };
+        })
       )
     );
 
@@ -196,7 +200,7 @@ function setCachedScrape(key, data) {
  * and a `complete` flag. All derived figures (missed days, budget, balances)
  * are computed client-side from these plus the user's local settings.
  */
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { cookies = {} } = req.body || {};
@@ -222,10 +226,10 @@ export default async function handler(req, res) {
     } else {
       // Fetch wallet page and first orders page in parallel.
       const [walletRes, ordersRes] = await Promise.all([
-        fetch(`${BASE_URL}/woo-wallet/`, {
+        countedFetch(`${BASE_URL}/woo-wallet/`, {
           headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
         }),
-        fetch(`${BASE_URL}/orders/`, {
+        countedFetch(`${BASE_URL}/orders/`, {
           headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
         }),
       ]);
@@ -236,6 +240,11 @@ export default async function handler(req, res) {
 
       const walletHtml = await walletRes.text();
       const ordersHtml = await ordersRes.text();
+
+      // Diagnostics only: log the block reason / IP, or a snippet of unexpected 4xx/5xx pages.
+      for (const [r, h] of [[walletRes, walletHtml], [ordersRes, ordersHtml]]) {
+        if (r.status >= 400 || isSecurityBlockPage(h)) inspectResponse('dashboard', r.status, h);
+      }
 
       if (walletHtml.includes('woocommerce-form-login') || ordersHtml.includes('woocommerce-form-login')) {
         return jsonError(res, 401, 'Session expired', true);
@@ -298,3 +307,5 @@ export default async function handler(req, res) {
     return jsonError(res, 500, 'Server error: ' + err.message);
   }
 }
+
+export default instrument('dashboard', handler);

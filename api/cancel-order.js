@@ -1,6 +1,6 @@
-import { USER_AGENT, cookieHeader, fetchFollowing, jsonError } from './_utils.js';
+import { USER_AGENT, cookieHeader, fetchFollowing, jsonError, instrument } from './_utils.js';
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { cookies = {}, cancelUrl } = req.body || {};
@@ -34,3 +34,5 @@ export default async function handler(req, res) {
     return jsonError(res, 500, 'Server error: ' + err.message);
   }
 }
+
+export default instrument('cancel-order', handler);

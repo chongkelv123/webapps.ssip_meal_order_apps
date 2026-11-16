@@ -7,6 +7,10 @@ import {
   fetchFollowing,
   dateToUnixTimestamp,
   jsonError,
+  countedFetch,
+  inspectResponse,
+  isSecurityBlockPage,
+  instrument,
 } from './_utils.js';
 
 const CHECKOUT_URL = `${BASE_URL}/checkout/`;
@@ -114,7 +118,7 @@ async function checkout(date, orderDetails, cookies) {
 
   for (const action of candidateActions) {
     try {
-      const tsRes = await fetch(exwfAjaxUrl, {
+      const tsRes = await countedFetch(exwfAjaxUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/x-www-form-urlencoded',
@@ -124,6 +128,7 @@ async function checkout(date, orderDetails, cookies) {
         body: new URLSearchParams({ action, date: exwfoodDate, security: exwfNonce }).toString(),
       });
       const tsText = await tsRes.text();
+      if (tsRes.status >= 400 || isSecurityBlockPage(tsText)) inspectResponse('place-order', tsRes.status, tsText); // diagnostics only
       console.log('[place-order] time-slot action=' + action + ' →', tsText.slice(0, 200));
 
       if (!tsText || tsText === '0' || tsText === '-1') continue;
@@ -181,7 +186,7 @@ async function checkout(date, orderDetails, cookies) {
     order_comments: orderDetails.orderNotes || orderDetails.deliveryTime || '',
   });
 
-  const postRes = await fetch(CHECKOUT_AJAX_URL, {
+  const postRes = await countedFetch(CHECKOUT_AJAX_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
@@ -198,6 +203,7 @@ async function checkout(date, orderDetails, cookies) {
   extractCookies(postRes, cookies);
 
   const text = await postRes.text();
+  if (postRes.status >= 400 || isSecurityBlockPage(text)) inspectResponse('place-order', postRes.status, text); // diagnostics only
   let json;
   try {
     json = JSON.parse(text);
@@ -216,7 +222,7 @@ async function checkout(date, orderDetails, cookies) {
   return { success: false, error: msg };
 }
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
 
   const { cookies: rawCookies = {}, productId, date, orderDetails } = req.body || {};
@@ -247,3 +253,5 @@ export default async function handler(req, res) {
     return jsonError(res, 500, 'Server error: ' + err.message);
   }
 }
+
+export default instrument('place-order', handler);
