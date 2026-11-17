@@ -1,5 +1,5 @@
 import { load } from 'cheerio';
-import { BASE_URL, USER_AGENT, BROWSER_HEADERS, cookieHeader, parsePrice, jsonError, isSecurityBlockPage, countedFetch, inspectResponse, instrument } from './_utils.js';
+import { BASE_URL, cookieHeader, parsePrice, jsonError, scrapeFetch, BlockedError, sendIfBlocked, instrument } from './_utils.js';
 import { getBillingPeriod } from '../src/lib/dashboardCalc.js';
 
 // ─── HTML extraction ─────────────────────────────────────────────────────────
@@ -84,19 +84,8 @@ function looksLikeOrdersPage(html) {
   return $('table.woocommerce-orders-table').length > 0 || $('.woocommerce-info').length > 0;
 }
 
-const BLOCKED_MESSAGE =
-  "The cafeteria site is blocking requests from our server right now, so your meals can't be refreshed. Please try again later.";
-
-// ─── Block back-off ──────────────────────────────────────────────────────────
-//
-// Once the site's firewall has blocked us, every further request (from every
-// user's retry) can prolong the block. Remember it and answer straight away
-// for a few minutes without contacting the site. Best-effort: per warm instance.
-const BLOCK_BACKOFF_MS = 5 * 60 * 1000;
-let blockedUntil = 0;
-
-/** Test hook: clears the back-off. */
-export function resetBlockBackoff() { blockedUntil = 0; }
+// Firewall blocks and the back-off are handled centrally by scrapeFetch
+// (api/_utils.js): a block throws BlockedError and is shared by every instance.
 
 // ─── Pagination ──────────────────────────────────────────────────────────────
 
@@ -133,21 +122,21 @@ async function fetchRemainingPages(cookies, billingPeriodStart) {
 
     const batchResults = await Promise.all(
       batchPages.map((p) =>
-        countedFetch(`${BASE_URL}/orders/${p}/`, {
-          headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
-        }).then(async (res) => {
-          if (res.ok) return { ok: true, html: await res.text() };
-          inspectResponse('dashboard', res.status, await res.text()); // diagnostics only
-          return { ok: false };
-        })
+        scrapeFetch(`${BASE_URL}/orders/${p}/`, {
+          headers: cookieStr ? { Cookie: cookieStr } : {},
+        }).then(
+          ({ res, text }) => (res.ok ? { ok: true, html: text } : { ok: false }),
+          // A block mid-history keeps what we have (marked incomplete) instead of failing the dashboard.
+          (err) => { if (err instanceof BlockedError) return { ok: false, blocked: true }; throw err; },
+        )
       )
     );
 
     // Process in page order so the "two consecutive out-of-range pages" stop
     // condition behaves identically to the old one-page-at-a-time loop.
     for (const result of batchResults) {
-      if (result.ok && isSecurityBlockPage(result.html)) blocked = true;
-      if (!result.ok || result.html.includes('woocommerce-form-login') || isSecurityBlockPage(result.html)) { done = true; break; }
+      if (result.blocked) blocked = true;
+      if (!result.ok || result.html.includes('woocommerce-form-login')) { done = true; break; }
 
       const { orders, hasNextPage } = extractOrdersFromHtml(result.html);
       if (orders.length === 0) { done = true; complete = true; break; }
@@ -215,45 +204,25 @@ async function handler(req, res) {
     const cacheKey = cookieStr || null;
     const cached   = cacheKey ? getCachedScrape(cacheKey) : null;
 
-    if (!cached && Date.now() < blockedUntil) {
-      return jsonError(res, 503, BLOCKED_MESSAGE);
-    }
-
     let walletBalanceRaw, allOrders, complete;
 
     if (cached) {
       ({ walletBalanceRaw, allOrders, complete } = cached);
     } else {
       // Fetch wallet page and first orders page in parallel.
-      const [walletRes, ordersRes] = await Promise.all([
-        countedFetch(`${BASE_URL}/woo-wallet/`, {
-          headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
-        }),
-        countedFetch(`${BASE_URL}/orders/`, {
-          headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...(cookieStr ? { Cookie: cookieStr } : {}) },
-        }),
+      // Gated by the shared back-off; a block page on either throws BlockedError (-> 503).
+      const headers = cookieStr ? { Cookie: cookieStr } : {};
+      const [{ res: walletRes, text: walletHtml }, { res: ordersRes, text: ordersHtml }] = await Promise.all([
+        scrapeFetch(`${BASE_URL}/woo-wallet/`, { headers }),
+        scrapeFetch(`${BASE_URL}/orders/`, { headers }),
       ]);
 
       if (walletRes.status === 302 || ordersRes.status === 302) {
         return jsonError(res, 401, 'Session expired', true);
       }
 
-      const walletHtml = await walletRes.text();
-      const ordersHtml = await ordersRes.text();
-
-      // Diagnostics only: log the block reason / IP, or a snippet of unexpected 4xx/5xx pages.
-      for (const [r, h] of [[walletRes, walletHtml], [ordersRes, ordersHtml]]) {
-        if (r.status >= 400 || isSecurityBlockPage(h)) inspectResponse('dashboard', r.status, h);
-      }
-
       if (walletHtml.includes('woocommerce-form-login') || ordersHtml.includes('woocommerce-form-login')) {
         return jsonError(res, 401, 'Session expired', true);
-      }
-
-      if (isSecurityBlockPage(walletHtml) || isSecurityBlockPage(ordersHtml)) {
-        blockedUntil = Date.now() + BLOCK_BACKOFF_MS;
-        console.error('[dashboard] firewall block page', { walletStatus: walletRes.status, ordersStatus: ordersRes.status });
-        return jsonError(res, 503, BLOCKED_MESSAGE);
       }
       if (!ordersRes.ok || !looksLikeOrdersPage(ordersHtml)) {
         // Surface what we actually got so the cause is visible in the Network tab / Vercel logs.
@@ -280,7 +249,6 @@ async function handler(req, res) {
       if (hasNextPage) {
         const extra = await fetchRemainingPages(cookies, billingPeriodStart);
         complete = complete && extra.complete;
-        if (extra.blocked) blockedUntil = Date.now() + BLOCK_BACKOFF_MS;
         // Keyed on delivery date too, not just orderDate + mealName: a single bulk
         // checkout books the same meal across many delivery dates, so those fields
         // alone collide across every day of that order and would wrongly drop all
@@ -303,6 +271,7 @@ async function handler(req, res) {
       complete,
     });
   } catch (err) {
+    if (sendIfBlocked(res, err)) return;
     console.error('[dashboard]', err);
     return jsonError(res, 500, 'Server error: ' + err.message);
   }

@@ -1,6 +1,7 @@
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-import handler, { resetBlockBackoff } from '../api/dashboard.js';
+import handler from '../api/dashboard.js';
+import * as store from '../api/_store.js';
 
 const BLOCK = '<html><body>Your access to this site has been limited by the site owner</body></html>';
 const CHALLENGE = '<html><head><title>Just a moment...</title></head><body>challenge</body></html>';
@@ -28,12 +29,14 @@ const call = async (walletHtml, ordersHtml, ordersStatus = 200) => {
   return out;
 };
 
-beforeEach(() => { console.error = () => {}; resetBlockBackoff(); });
+beforeEach(() => { console.error = () => {}; store.clear(); });
 
 test('a firewall block page is an error, not an empty meal list', async () => {
   const r = await call(WALLET, BLOCK);
   assert.equal(r.status, 503);
   assert.match(r.body.error, /blocking/);
+  assert.equal(r.body.blocked, true);
+  assert.ok(r.body.retryAfterSec > 0);
 });
 
 test('an unexpected page (challenge / error) is an error with diagnostics', async () => {

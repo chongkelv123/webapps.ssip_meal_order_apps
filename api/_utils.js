@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import * as kv from './_store.js';
 
 export const BASE_URL ='https://ssip-cafeteria.whew.life';
 
@@ -58,30 +59,16 @@ export function cookieHeader(cookies) {
 
 /**
  * Fetch a URL, manually following redirects so we can capture Set-Cookie at
- * every hop. Returns { res, text, cookies }.
+ * every hop. Every hop goes through scrapeFetch, so it is gated by the shared
+ * back-off and throws BlockedError on a firewall block.
+ * Returns { res, text, cookies, sessionExpired }.
  */
 export async function fetchFollowing(url, options = {}, cookieJar = {}, maxRedirects = 10) {
   let currentUrl = url;
   let hops = 0;
 
   while (hops < maxRedirects) {
-    const headers = {
-      'User-Agent': USER_AGENT,
-      ...BROWSER_HEADERS,
-      ...options.headers,
-    };
-    if (Object.keys(cookieJar).length > 0) {
-      headers['Cookie'] = cookieHeader(cookieJar);
-    }
-
-    const res = await countedFetch(currentUrl, {
-      ...options,
-      headers,
-      redirect: 'manual',
-    });
-
-    // Merge cookies from this hop
-    extractCookies(res, cookieJar);
+    const { res, text } = await scrapeFetch(currentUrl, { ...options, redirect: 'manual' }, cookieJar);
 
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const location = res.headers.get('location');
@@ -95,14 +82,9 @@ export async function fetchFollowing(url, options = {}, cookieJar = {}, maxRedir
       continue;
     }
 
-    const text = await res.text();
-
-    // Diagnostics only: logs [wf-block] / [wf-unrecognised]; behaviour unchanged.
-    if (res.status >= 400 || isSecurityBlockPage(text)) inspectResponse(null, res.status, text);
-
     // Session expiry: WooCommerce redirected us to the login page
     const sessionExpired =
-      res.url?.includes('/my-account/') &&
+      (res.url || currentUrl).includes('/my-account/') &&
       text.includes('woocommerce-form-login');
 
     return { res, text, cookies: cookieJar, sessionExpired };
@@ -239,9 +221,131 @@ export function instrument(endpoint, handler) {
   };
 }
 
-/** Drop-in for fetch() that counts the call toward the current handler's total. */
+/** fetch() that counts the call toward the current handler's total. Only scrapeFetch should call it. */
 export function countedFetch(url, options) {
   const store = outboundStore.getStore();
   if (store) store.count++;
   return fetch(url, options);
+}
+
+// ─── Shared firewall back-off ────────────────────────────────────────────────
+//
+// All users share our server's egress IP, so to the site's firewall we are one
+// visitor. Once it blocks us, every further request (any user, any instance)
+// can extend the block. The block state lives in the shared store, so all
+// instances stop contacting the site until it expires.
+
+export const BLOCK_KEY = 'wf:block';
+const BLOCK_BASE_SEC = 10 * 60;    // first block: 10 min
+const BLOCK_MAX_SEC = 60 * 60;     // cap: 60 min
+const STRIKE_MEMORY_SEC = 6 * 3600; // a block within 6 h of the last one escalates
+
+export const BLOCKED_MESSAGE =
+  "The cafeteria site is temporarily blocking requests from our server. This isn't a problem with your account or password.";
+
+export class BlockedError extends Error {
+  constructor({ retryAfterSec, reason = null, status = null, blockedIp = null, rawSnippet = null } = {}) {
+    super(BLOCKED_MESSAGE);
+    this.name = 'BlockedError';
+    this.retryAfterSec = Math.max(1, Math.ceil(retryAfterSec || BLOCK_BASE_SEC));
+    this.reason = reason;
+    this.status = status;
+    this.blockedIp = blockedIp;
+    this.rawSnippet = rawSnippet; // plain text only, safe to log / return from /api/diag
+  }
+}
+
+/**
+ * A detected block trips the shared back-off unless it is a bare 403 with no
+ * Wordfence wording: WordPress answers a stale admin-ajax nonce with "-1" and
+ * 403, and one user's stale nonce must not lock everyone out. A real Wordfence
+ * 403 carries its banner and is still caught.
+ */
+function tripsBackoff(parsed) {
+  return parsed.blocked && parsed.reason !== 'http-403';
+}
+
+/** Current block record { until, strikes, reason } if still active, else null. Memoised per handler invocation. */
+async function activeBlock() {
+  const ctx = outboundStore.getStore();
+  if (ctx && ctx.block !== undefined) return ctx.block && ctx.block.until > Date.now() ? ctx.block : null;
+  const rec = await kv.get(BLOCK_KEY);
+  if (ctx) ctx.block = rec || null;
+  return rec && rec.until > Date.now() ? rec : null;
+}
+
+/**
+ * Record a block. While a block is already active (requests that were in
+ * flight when it started) we don't escalate; a fresh block within
+ * STRIKE_MEMORY_SEC of the last one doubles the wait, up to BLOCK_MAX_SEC.
+ */
+export async function recordBlock({ reason = null } = {}) {
+  const now = Date.now();
+  const prev = await kv.get(BLOCK_KEY);
+  if (prev && prev.until > now) return prev;
+  const strikes = (prev?.strikes || 0) + 1;
+  const sec = Math.min(BLOCK_BASE_SEC * 2 ** (strikes - 1), BLOCK_MAX_SEC);
+  const rec = { until: now + sec * 1000, strikes, reason, since: now };
+  await kv.set(BLOCK_KEY, rec, sec + STRIKE_MEMORY_SEC);
+  const ctx = outboundStore.getStore();
+  if (ctx) ctx.block = rec;
+  console.error('[wf-backoff]', { strikes, backoffSec: sec, reason });
+  return rec;
+}
+
+/**
+ * The single path for every request to the cafeteria site.
+ * - applies USER_AGENT + BROWSER_HEADERS (options.headers override them);
+ * - with a cookieJar: sends it as the Cookie header (unless options.headers
+ *   has one) and merges Set-Cookie back into it;
+ * - refuses to send while the shared back-off is active (throws BlockedError);
+ * - reads the body, detects a firewall block, records it and throws BlockedError;
+ * - counts the request for the [outbound] log.
+ * `ignoreBackoff: true` skips the pre-send gate (only /api/diag uses it).
+ * Returns { res, text }.
+ */
+export async function scrapeFetch(url, options = {}, cookieJar = null) {
+  const { ignoreBackoff = false, headers: extra = {}, ...rest } = options;
+
+  if (!ignoreBackoff) {
+    const block = await activeBlock();
+    if (block) throw new BlockedError({ retryAfterSec: (block.until - Date.now()) / 1000, reason: block.reason });
+  }
+
+  const headers = { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS, ...extra };
+  if (cookieJar && Object.keys(cookieJar).length > 0 && !headers.Cookie) {
+    headers.Cookie = cookieHeader(cookieJar);
+  }
+
+  const res = await countedFetch(url, { ...rest, headers });
+  if (cookieJar && res.headers) extractCookies(res, cookieJar);
+  const text = await res.text();
+
+  if (res.status >= 400 || isSecurityBlockPage(text)) {
+    const parsed = inspectResponse(null, res.status, text); // logs [wf-block] / [wf-unrecognised]
+    if (tripsBackoff(parsed)) {
+      const rec = await recordBlock({ reason: parsed.reason });
+      throw new BlockedError({
+        retryAfterSec: (rec.until - Date.now()) / 1000,
+        reason: parsed.reason,
+        status: res.status,
+        blockedIp: parsed.blockedIp,
+        rawSnippet: parsed.rawSnippet,
+      });
+    }
+  }
+
+  return { res, text };
+}
+
+/** If err is a BlockedError, send the standard 503 and return true. */
+export function sendIfBlocked(res, err) {
+  if (!(err instanceof BlockedError)) return false;
+  res.status(503).json({
+    error: BLOCKED_MESSAGE,
+    blocked: true,
+    retryAfterSec: err.retryAfterSec,
+    sessionExpired: false,
+  });
+  return true;
 }

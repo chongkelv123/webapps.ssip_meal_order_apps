@@ -1,5 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
-import { BASE_URL, USER_AGENT, BROWSER_HEADERS, countedFetch, instrument, parseBlockPage, inspectResponse } from './_utils.js';
+import { BASE_URL, BLOCK_KEY, BlockedError, scrapeFetch, instrument, parseBlockPage } from './_utils.js';
 import * as store from './_store.js';
 
 const CACHE_KEY = 'diag:last';
@@ -13,23 +13,41 @@ function tokenOk(given) {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-/** One unauthenticated GET, no redirects. Never throws. */
-async function probe(path, label) {
+/**
+ * One unauthenticated GET, no redirects. Never throws. Goes through scrapeFetch
+ * so it is counted and a block it finds starts the shared back-off, but it
+ * skips the back-off gate: during a back-off this is how we see whether the
+ * site is still blocking us.
+ */
+async function probe(path) {
   try {
-    const res = await countedFetch(`${BASE_URL}${path}`, {
-      headers: { 'User-Agent': USER_AGENT, ...BROWSER_HEADERS },
+    const { res, text } = await scrapeFetch(`${BASE_URL}${path}`, {
       redirect: 'manual',
       signal: AbortSignal.timeout(10000),
+      ignoreBackoff: true,
     });
-    const html = await res.text();
-    const parsed = parseBlockPage(html, res.status);
-    if (parsed.blocked) inspectResponse(`diag:${label}`, res.status, html);
+    const parsed = parseBlockPage(text, res.status);
     const out = { status: res.status, blocked: parsed.blocked, reason: parsed.reason, blockedIp: parsed.blockedIp };
     if (parsed.blocked) out.rawSnippet = parsed.rawSnippet;
     return out;
   } catch (err) {
+    if (err instanceof BlockedError) {
+      return { status: err.status, blocked: true, reason: err.reason, blockedIp: err.blockedIp, rawSnippet: err.rawSnippet };
+    }
     return { status: null, blocked: null, reason: null, blockedIp: null, error: err.message };
   }
+}
+
+/** The shared back-off as seen by every instance, or null when none is active. */
+async function backoffState() {
+  const rec = await store.get(BLOCK_KEY);
+  if (!rec || rec.until <= Date.now()) return { active: false, strikes: rec?.strikes || 0 };
+  return {
+    active: true,
+    strikes: rec.strikes,
+    reason: rec.reason,
+    retryAfterSec: Math.ceil((rec.until - Date.now()) / 1000),
+  };
 }
 
 async function egressIp() {
@@ -63,7 +81,7 @@ async function handler(req, res) {
   const cached = await store.get(CACHE_KEY);
   if (cached) return res.status(200).json({ ...cached, cached: true });
 
-  const [home, myAccount, ip] = await Promise.all([probe('/', 'home'), probe('/my-account/', 'my-account'), egressIp()]);
+  const [home, myAccount, ip] = await Promise.all([probe('/'), probe('/my-account/'), egressIp()]);
 
   const payload = {
     region: process.env.VERCEL_REGION || 'local',
@@ -75,6 +93,8 @@ async function handler(req, res) {
     blockedIp: home.blockedIp,
     home,
     myAccount,
+    backoff: await backoffState(),
+    store: process.env.UPSTASH_REDIS_REST_URL ? 'upstash' : 'memory',
     checkedAt: new Date().toISOString(),
   };
   await store.set(CACHE_KEY, payload, CACHE_TTL_SEC);

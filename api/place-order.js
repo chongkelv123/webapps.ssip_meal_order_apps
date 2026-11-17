@@ -2,14 +2,12 @@ import { load } from 'cheerio';
 import {
   BASE_URL,
   USER_AGENT,
-  cookieHeader,
-  extractCookies,
   fetchFollowing,
+  scrapeFetch,
+  BlockedError,
+  sendIfBlocked,
   dateToUnixTimestamp,
   jsonError,
-  countedFetch,
-  inspectResponse,
-  isSecurityBlockPage,
   instrument,
 } from './_utils.js';
 
@@ -118,17 +116,11 @@ async function checkout(date, orderDetails, cookies) {
 
   for (const action of candidateActions) {
     try {
-      const tsRes = await countedFetch(exwfAjaxUrl, {
+      const { text: tsText } = await scrapeFetch(exwfAjaxUrl, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/x-www-form-urlencoded',
-          'User-Agent': USER_AGENT,
-          Cookie: cookieHeader(cookies),
-        },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ action, date: exwfoodDate, security: exwfNonce }).toString(),
-      });
-      const tsText = await tsRes.text();
-      if (tsRes.status >= 400 || isSecurityBlockPage(tsText)) inspectResponse('place-order', tsRes.status, tsText); // diagnostics only
+      }, cookies);
       console.log('[place-order] time-slot action=' + action + ' →', tsText.slice(0, 200));
 
       if (!tsText || tsText === '0' || tsText === '-1') continue;
@@ -152,6 +144,7 @@ async function checkout(date, orderDetails, cookies) {
       console.log('[place-order] Using time slot value:', exwfoodTime);
       break;
     } catch (e) {
+      if (e instanceof BlockedError) throw e; // stop: don't keep probing a site that's blocking us
       console.log('[place-order] action=' + action + ' failed:', e.message);
     }
   }
@@ -186,24 +179,17 @@ async function checkout(date, orderDetails, cookies) {
     order_comments: orderDetails.orderNotes || orderDetails.deliveryTime || '',
   });
 
-  const postRes = await countedFetch(CHECKOUT_AJAX_URL, {
+  const { text } = await scrapeFetch(CHECKOUT_AJAX_URL, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded',
-      'User-Agent': USER_AGENT,
-      Cookie: cookieHeader(cookies),
       Accept: 'application/json, text/javascript, */*; q=0.01',
       'X-Requested-With': 'XMLHttpRequest',
       Origin: BASE_URL,
       Referer: CHECKOUT_URL,
     },
     body: formData.toString(),
-  });
-
-  extractCookies(postRes, cookies);
-
-  const text = await postRes.text();
-  if (postRes.status >= 400 || isSecurityBlockPage(text)) inspectResponse('place-order', postRes.status, text); // diagnostics only
+  }, cookies);
   let json;
   try {
     json = JSON.parse(text);
@@ -246,6 +232,7 @@ async function handler(req, res) {
     const result = await checkout(date, orderDetails, cookies);
     return res.status(200).json(result);
   } catch (err) {
+    if (sendIfBlocked(res, err)) return;
     if (err.message === 'SESSION_EXPIRED') {
       return jsonError(res, 401, 'Session expired', true);
     }
