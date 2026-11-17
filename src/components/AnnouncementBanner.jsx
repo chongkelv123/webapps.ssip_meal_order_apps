@@ -2,16 +2,20 @@ import { useState, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
 
 // Bump the id whenever a new notice should ignore prior dismissals.
-const NOTICE_ID = 'server-back-missed-meals-2026-11-12';
-const EXPIRES_AT = new Date('2026-11-26T00:00:00');
+const NOTICE_ID = 'maintenance-cafeteria-block-2026-11-17';
+const EXPIRES_AT = new Date('2026-12-31T00:00:00');
 const STORAGE_KEY = `notice_dismissed_${NOTICE_ID}`;
+
+// Maintenance mode: shown on every page (login included) and not dismissible.
+// Set to false, or replace with a normal notice, once the cafeteria block is resolved.
+const MAINTENANCE = true;
 
 export default function AnnouncementBanner() {
   const [visible, setVisible] = useState(false);
   const { pathname } = useLocation();
 
   useEffect(() => {
-    const dismissed = localStorage.getItem(STORAGE_KEY);
+    const dismissed = !MAINTENANCE && localStorage.getItem(STORAGE_KEY);
     if (!dismissed && new Date() < EXPIRES_AT) {
       setVisible(true);
     }
@@ -22,8 +26,19 @@ export default function AnnouncementBanner() {
     setVisible(false);
   }
 
-  // Shown on the dashboard only.
-  if (!visible || pathname !== '/dashboard') return null;
+  if (!visible) return null;
+
+  if (MAINTENANCE) {
+    return (
+      <div role="status" className="bg-amber-50 text-amber-900 text-sm px-4 py-2.5 text-center">
+        🛠️ Under maintenance: the cafeteria site is currently blocking this app, so login, menus and
+        ordering may not work. Please order on the cafeteria website directly for now. Sorry for the trouble.
+      </div>
+    );
+  }
+
+  // Normal notices are shown on the dashboard only.
+  if (pathname !== '/dashboard') return null;
 
   return (
     <div className="bg-emerald-50 text-emerald-800 text-sm px-4 py-2.5 flex items-center justify-center gap-3">
