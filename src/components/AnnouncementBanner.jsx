@@ -30,9 +30,9 @@ export default function AnnouncementBanner() {
 
   if (MAINTENANCE) {
     return (
-      <div role="status" className="bg-amber-50 text-amber-900 text-sm px-4 py-2.5 text-center">
-        🛠️ Under maintenance: the cafeteria site is currently blocking this app, so login, menus and
-        ordering may not work. Please order on the cafeteria website directly for now. Sorry for the trouble.
+      <div role="status" className="bg-amber-50 text-amber-900 text-sm px-4 py-2.5 text-center">        
+        📢Notice: The cafeteria site (GA) has blocked this app, so ordering is unavailable until we’re added to its allowlist. 
+        Please order on the cafeteria website directly. The convenient way to order is end.
       </div>
     );
   }
